@@ -57,6 +57,9 @@ CLAUDE.md
 # Store screenshots (dev only)
 assets/store-screenshots.html
 
+# Personal Claude Code config
+CLAUDE.local.md
+
 # Extension packagée
 *.crx
 *.pem
