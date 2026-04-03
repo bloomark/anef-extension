@@ -40,6 +40,9 @@ docs/data/
 bugs/
 tests/
 
+# Personal Claude Code config
+CLAUDE.local.md
+
 # Extension packagée
 *.crx
 *.pem
