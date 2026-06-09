@@ -1,6 +1,6 @@
 # Politique de confidentialité — ANEF Status Tracker
 
-*Dernière mise à jour : 15 février 2026*
+*Dernière mise à jour : 23 avril 2026*
 
 ## Données collectées
 
@@ -9,15 +9,47 @@
 - **Identifiants ANEF** : chiffrés localement avec AES-256-GCM, jamais transmis à des tiers
 - **Paramètres** : préférences de notifications et de vérification automatique
 - **Journal des vérifications** : horodatage des vérifications automatiques (conservé 24h)
+- **Préférence d'affichage du mode privé** : état activé/désactivé du bouton de masquage visuel
 
-### Statistiques anonymes (opt-in)
-Si vous activez les statistiques anonymes dans les paramètres, les données suivantes sont envoyées :
-- Étape actuelle du dossier (numéro uniquement)
-- Statut actuel (code uniquement)
+### Mode privé (masquage visuel)
+Un bouton en forme d'œil dans l'interface permet de masquer visuellement (effet flou CSS) les données sensibles — numéro de dossier, numéro national, préfecture, dates, lieu d'entretien, numéro de décret, type de demande. Cette fonctionnalité est purement locale : aucune donnée n'est transmise ou modifiée, seul l'affichage est altéré pour faciliter le partage d'écran ou les captures.
+
+### Statistiques anonymes
+Les données suivantes sont envoyées à Supabase (hébergé en UE) pour alimenter les statistiques communautaires sur les délais de naturalisation :
+
+**Identifiant pseudonymisé :**
+- Le numéro de dossier est transformé en identifiant opaque au moyen d'une pseudonymisation cryptographique à double étage incluant une clé secrète serveur. Il est non-réversible vers le numéro d'origine.
+- L'interface des statistiques publiques n'affiche aucun identifiant reconnaissable : les dossiers y sont représentés uniquement par leurs métadonnées (statut, préfecture, dates).
+
+**Données liées au dossier :**
+- Étape actuelle (numéro de 1 à 12)
+- Phase de traitement (libellé associé à l'étape)
+- Statut actuel (code technique, ex. `instruction_a_affecter`)
+- Date de dépôt du dossier (jour uniquement, sans heure)
+- Date du dernier changement de statut (jour uniquement)
+- Présence d'une demande de complément (oui/non)
+- Type de demande (ex. naturalisation)
+
+**Données géographiques :**
 - Département de la préfecture
-- Date du dernier changement de statut
+- Code postal du domicile (utilisé pour déterminer le département si la préfecture est absente)
+- Ville du domicile
+- Lieu de l'entretien d'assimilation
 
-Ces données sont **agrégées et anonymes** : aucun identifiant personnel, numéro de dossier, nom ou adresse email n'est collecté ni transmis.
+**Données liées à l'entretien et au décret :**
+- Date de l'entretien d'assimilation (jour uniquement)
+- Numéro de décret (si applicable)
+
+**Données techniques :**
+- Version de l'extension
+- Horodatage de la vérification
+- Source de la donnée (automatique ou saisie manuelle)
+
+Ces données sont **pseudonymisées** : aucun nom, email, numéro de dossier en clair ou donnée d'identification directe n'est collecté ni transmis. Cependant, la combinaison de certains champs (code postal, ville, lieu d'entretien) pourrait théoriquement permettre une ré-identification dans les préfectures traitant peu de dossiers.
+
+### Note sur les données antérieures au 23 avril 2026
+
+Un renforcement de la pseudonymisation a été déployé le 23 avril 2026. Les nouvelles données suivent le modèle décrit ci-dessus. Des exports antérieurs à cette date, s'ils ont été téléchargés et archivés par des tiers avant la mise à jour, restent hors de notre contrôle. Si vous souhaitez que votre dossier soit retiré de la base communautaire, contactez-nous via GitHub.
 
 ## Données NON collectées
 - Aucun nom, email ou information personnelle
@@ -32,10 +64,10 @@ Ces données sont **agrégées et anonymes** : aucun identifiant personnel, num�
 
 ## Autorisations
 - **storage** : stockage local des données du dossier et des paramètres
-- **alarms** : vérification automatique périodique du statut
+- **alarms** : vérification automatique périodique du statut (par défaut toutes les 60 minutes)
 - **notifications** : alertes lors des changements de statut
-- **tabs** : ouverture temporaire du portail ANEF pour les vérifications automatiques
-- **Accès au site ANEF** : lecture des données de votre dossier sur le portail officiel
+- **clipboardWrite** : bouton "copier" sur les éléments affichés
+- **Accès au site ANEF** : lecture des données de votre dossier sur le portail officiel et son mécanisme d'authentification
 
 ## Contact
 Pour toute question concernant cette politique de confidentialité, ouvrez une issue sur le dépôt GitHub du projet.

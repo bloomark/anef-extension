@@ -6,30 +6,84 @@
 
   window.ANEF = window.ANEF || {};
 
+  // Formateur Intl créé UNE seule fois : l'instancier coûte ~0,1 ms, donc le
+  // recréer à chaque appel (≈20k fois au chargement) ajoutait ~2 s. Réutilisé ici.
+  var _parisDateFmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit'
+  });
+  // Mémoïsation par instant : formatToParts (conversion timezone) coûte ~0,2 ms,
+  // mais les mêmes dates reviennent souvent (today, date_depot/statut partagés).
+  var _parisCache = new Map();
+  function toParisCalendarUTC(d) {
+    var key = d.getTime();
+    var hit = _parisCache.get(key);
+    if (hit !== undefined) return hit;
+    var parts = _parisDateFmt.formatToParts(d);
+    var y = 0, m = 0, day = 0;
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].type === 'year') y = +parts[i].value;
+      else if (parts[i].type === 'month') m = +parts[i].value;
+      else if (parts[i].type === 'day') day = +parts[i].value;
+    }
+    var res = Date.UTC(y, m - 1, day);
+    _parisCache.set(key, res);
+    return res;
+  }
+
+  // Chemin rapide pour les chaînes "YYYY-MM-DD" : minuit UTC tombe toujours le
+  // même jour calendaire en Europe/Paris (UTC+1/+2), donc inutile de passer par
+  // Intl — arithmétique pure. Les timestamps complets gardent la voie mémoïsée.
+  var _DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
+  function _toCalendarUTC(v) {
+    if (typeof v === 'string') {
+      var mm = _DATE_ONLY.exec(v);
+      if (mm) {
+        var y = +mm[1], mo = +mm[2], dd = +mm[3];
+        var t = Date.UTC(y, mo - 1, dd);
+        // Garde-fou : Date.UTC fait un rollover silencieux sur mois/jour hors
+        // plage. On ne garde le chemin rapide que si la date ne déborde pas —
+        // sinon on laisse la voie lente reproduire exactement new Date(str)
+        // (qui renvoie Invalid Date → null). Round-trip = arithmétique pure.
+        var chk = new Date(t);
+        if (chk.getUTCFullYear() === y && chk.getUTCMonth() === mo - 1 && chk.getUTCDate() === dd) {
+          return t;
+        }
+      }
+    }
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d)) return NaN;
+    return toParisCalendarUTC(d);
+  }
+
   function daysDiff(dateStr1, dateStr2OrDate) {
     try {
-      var d1 = new Date(dateStr1);
-      var d2 = dateStr2OrDate instanceof Date ? dateStr2OrDate : new Date(dateStr2OrDate);
-      if (isNaN(d1) || isNaN(d2)) return null;
-      return Math.max(0, Math.floor((d2 - d1) / 86400000));
+      var u1 = _toCalendarUTC(dateStr1);
+      var u2 = _toCalendarUTC(dateStr2OrDate);
+      if (isNaN(u1) || isNaN(u2)) return null;
+      return Math.max(0, Math.round((u2 - u1) / 86400000));
     } catch(e) {
       return null;
     }
   }
 
   function formatDuration(days) {
-    if (days === null || days === undefined) return '\u2014';
-    if (days === 0) return "aujourd'hui";
+    if (days === null || days === undefined || isNaN(days) || days < 0) return '\u2014';
+    if (days === 0) return '< 1 jour';
     if (days < 30) return days + ' jour' + (days > 1 ? 's' : '');
-    var months = Math.floor(days / 30);
-    var remainDays = days % 30;
-    if (months < 12) {
-      if (remainDays === 0) return months + ' mois';
-      return months + ' mois, ' + remainDays + ' j';
+    if (days < 365) {
+      var months = Math.floor(days / 30);
+      var remain = days % 30;
+      if (remain === 0) return months + ' mois';
+      return months + ' mois, ' + remain + ' j';
     }
     var years = Math.floor(days / 365);
-    var remainMonths = Math.floor((days % 365) / 30);
-    return years + ' an' + (years > 1 ? 's' : '') + ', ' + remainMonths + ' mois';
+    var rest = days % 365;
+    var m = Math.floor(rest / 30);
+    var d = rest % 30;
+    var parts = [years + ' an' + (years > 1 ? 's' : '')];
+    if (m > 0) parts.push(m + ' mois');
+    if (d > 0) parts.push(d + ' j');
+    return parts.join(', ');
   }
 
   function formatDateFr(dateStr) {

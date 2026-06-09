@@ -8,20 +8,31 @@
   var U = ANEF.utils;
   var D = ANEF.data;
   var F = ANEF.filters;
+  var _timelineWrapper = null;
   var CH = ANEF.charts;
 
   var allSummaries = [];
 
   // ─── Data freshness indicator ───
-  // Uses the Last-Modified header of snapshots.json (deployed by GitHub Actions)
-  // as the single source of truth for when data was last refreshed.
+  // Source of truth: Last-Modified header of snapshots.json (rewritten on each
+  // refresh-data.yml run, triggered by cron-job.org via workflow_dispatch).
+  // See: .github/workflows/refresh-data.yml
   var _freshnessInterval = null;
+
+  // Expected refresh cadence. cron-job.org currently fires every 60min.
+  // If the external schedule changes, bump this constant — it also drives
+  // the green/orange/red thresholds below.
+  var EXPECTED_REFRESH_INTERVAL_MIN = 60;
 
   function startFreshnessIndicator(fallbackTimestamp) {
     var dot = document.getElementById('freshness-dot');
     var text = document.getElementById('freshness-text');
     var sub = document.getElementById('kpi-updated-sub');
     if (!dot || !text) return;
+
+    // Click handler to show cron history
+    var card = dot.closest('.kpi-timer-card');
+    if (card) card.addEventListener('click', showCronHistory);
 
     // HEAD request on snapshots.json to get the real deploy time
     fetch('./data/snapshots.json', { method: 'HEAD' })
@@ -36,8 +47,11 @@
         function tick() {
           var ageMin = Math.floor((Date.now() - updatedAt) / 60000);
 
-          // Freshness classes: green < 90min, orange < 150min, red >= 150min
-          var cls = ageMin < 90 ? '' : ageMin < 150 ? 'warn' : 'stale';
+          // Thresholds scale with the expected cadence:
+          // green < 1.5× interval, orange < 2.5× interval, red ≥ 2.5×
+          var greenUntil = EXPECTED_REFRESH_INTERVAL_MIN * 1.5;
+          var orangeUntil = EXPECTED_REFRESH_INTERVAL_MIN * 2.5;
+          var cls = ageMin < greenUntil ? '' : ageMin < orangeUntil ? 'warn' : 'stale';
           dot.className = 'freshness-dot' + (cls ? ' ' + cls : '');
           text.className = 'freshness-text' + (cls ? ' ' + cls : '');
 
@@ -66,6 +80,101 @@
       })
       .catch(function() {
         text.textContent = 'indisponible';
+      });
+  }
+
+  // ─── Cron history modal ───
+  // per_page=30 → ~30h of history at the current hourly cadence.
+  var GITHUB_RUNS_API = 'https://api.github.com/repos/Letranger-dev/anef-extension/actions/workflows/refresh-data.yml/runs?per_page=30';
+
+  function formatAgo(dateStr) {
+    var min = Math.floor((Date.now() - new Date(dateStr).getTime()) / 60000);
+    if (min < 1) return "\u00e0 l'instant";
+    if (min < 60) return 'il y a ' + min + ' min';
+    var h = Math.floor(min / 60);
+    if (h < 24) return 'il y a ' + h + 'h' + (min % 60 > 0 ? String(min % 60).padStart(2, '0') : '');
+    var d = Math.floor(h / 24);
+    return 'il y a ' + d + 'j';
+  }
+
+  function formatDateFR(dateStr) {
+    var d = new Date(dateStr);
+    return String(d.getDate()).padStart(2, '0') + '/'
+      + String(d.getMonth() + 1).padStart(2, '0') + ' \u00e0 '
+      + String(d.getHours()).padStart(2, '0') + ':'
+      + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  function conclusionClass(conclusion, status) {
+    if (status === 'in_progress') return 'in_progress';
+    if (conclusion === 'success') return 'success';
+    if (conclusion === 'failure') return 'failure';
+    return 'cancelled';
+  }
+
+  function showCronHistory() {
+    // Remove existing modal if any
+    var existing = document.getElementById('cron-history-overlay');
+    if (existing) existing.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'cron-history-overlay';
+    overlay.className = 'history-modal-overlay open';
+
+    overlay.innerHTML =
+      '<div class="history-modal" style="max-width:440px">' +
+        '<div class="history-modal-header">' +
+          '<h3>Historique des actualisations</h3>' +
+          '<button class="history-close" id="cron-close">\u00d7</button>' +
+        '</div>' +
+        '<div class="modal-history-list" id="cron-list">' +
+          '<div style="text-align:center;color:var(--text-dim);padding:1.5rem 0">Chargement\u2026</div>' +
+        '</div>' +
+      '</div>';
+
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener('click', function(e) {
+      if (e.target === overlay || e.target.closest('.history-close')) overlay.remove();
+    });
+
+    fetch(GITHUB_RUNS_API)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var runs = data.workflow_runs || [];
+        var list = document.getElementById('cron-list');
+        if (!runs.length) {
+          list.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:1rem">Aucun run trouvé</div>';
+          return;
+        }
+
+        var html = '';
+        for (var i = 0; i < runs.length; i++) {
+          var r = runs[i];
+          var cls = conclusionClass(r.conclusion, r.status);
+          var dur = '';
+          if (r.updated_at && r.run_started_at) {
+            var secs = Math.round((new Date(r.updated_at) - new Date(r.run_started_at)) / 1000);
+            dur = secs + 's';
+          }
+          // All automated refreshes come through workflow_dispatch (triggered by
+          // cron-job.org). Manual runs from the GitHub UI are indistinguishable
+          // via the API, so we label them all "auto" — matches the user's mental model.
+          var trigger = r.event === 'schedule' ? 'cron' : r.event === 'workflow_dispatch' ? 'auto' : r.event;
+
+          html += '<div class="cron-run-item">'
+            + '<span class="cron-run-dot ' + U.escapeHtml(cls) + '"></span>'
+            + '<span class="cron-run-date">' + U.escapeHtml(formatDateFR(r.created_at)) + '</span>'
+            + '<span class="cron-run-ago">' + U.escapeHtml(formatAgo(r.created_at)) + '</span>'
+            + '<span class="cron-run-trigger">' + U.escapeHtml(trigger) + '</span>'
+            + '<span class="cron-run-duration">' + U.escapeHtml(dur) + '</span>'
+            + '</div>';
+        }
+        list.innerHTML = html;
+      })
+      .catch(function(err) {
+        var list = document.getElementById('cron-list');
+        if (list) list.innerHTML = '<div style="text-align:center;color:var(--red);padding:1rem">Erreur : ' + U.escapeHtml(err.message) + '</div>';
       });
   }
 
@@ -159,19 +268,55 @@
     }
     var decretKeys = Object.keys(decretMap);
     if (decretKeys.length > 0) {
-      decretKeys.sort();
+      decretKeys.sort(sortDecretNum);
       var lastDecret = decretKeys[decretKeys.length - 1];
       var lastDecretDossiers = decretMap[lastDecret];
       var card = document.getElementById('kpi-decret-card');
       card.style.display = '';
       U.setText('kpi-decret', lastDecret);
-      U.setText('kpi-decret-sub', lastDecretDossiers.length + ' dossier' + (lastDecretDossiers.length > 1 ? 's' : ''));
-      card.onclick = function() { showDecretDossiers(lastDecret, decretMap[lastDecret]); };
+      var totalDossiers = 0;
+      for (var dk = 0; dk < decretKeys.length; dk++) totalDossiers += decretMap[decretKeys[dk]].length;
+      var lastPublished = isDecretPublished(lastDecretDossiers);
+      var lastBadgeCls = lastPublished ? 'decret-status decret-status-pub' : 'decret-status decret-status-pending';
+      var lastBadgeTxt = lastPublished ? 'Publi\u00e9 au JO' : 'En attente JO';
+      var countTxt = decretKeys.length + ' d\u00e9cret' + (decretKeys.length > 1 ? 's' : '') + ' \u2014 ' + totalDossiers + ' dossier' + (totalDossiers > 1 ? 's' : '');
+      var subEl = document.getElementById('kpi-decret-sub');
+      if (subEl) {
+        subEl.innerHTML =
+          '<span class="' + lastBadgeCls + '">' + lastBadgeTxt + '</span>' +
+          '<span class="kpi-decret-count">' + U.escapeHtml(countTxt) + '</span>';
+      }
+      card.onclick = function() { showAllDecrets(decretMap); };
     }
   }
 
+  // Un d\u00e9cret est publi\u00e9 au JO d\u00e8s qu'au moins un de ses dossiers
+  // atteint le statut "decret_naturalisation_publie" (ou variantes \u00e9tape 12).
+  function isDecretPublished(dossiers) {
+    if (!dossiers) return false;
+    for (var i = 0; i < dossiers.length; i++) {
+      var statut = String(dossiers[i].statut || '').toLowerCase();
+      if (statut === 'decret_naturalisation_publie' ||
+          statut === 'decret_naturalisation_publie_jo' ||
+          statut === 'decret_publie') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Tri naturel des num\u00e9ros de d\u00e9cret : "9" < "10" < "161".
+  function sortDecretNum(a, b) {
+    var na = parseInt(a, 10);
+    var nb = parseInt(b, 10);
+    var pureA = !isNaN(na) && String(na) === String(a);
+    var pureB = !isNaN(nb) && String(nb) === String(b);
+    if (pureA && pureB) return na - nb;
+    return String(a).localeCompare(String(b), 'fr', { numeric: true });
+  }
+
   function renderTimeline(summaries) {
-    var wrapper = document.getElementById('timeline-wrapper');
+    var wrapper = _timelineWrapper = document.getElementById('timeline-wrapper');
     var STATUTS = C.STATUTS;
 
     // Group by step, then by statut within each step
@@ -191,6 +336,8 @@
       'verification_formelle_a_traiter': 'Re\u00e7u, tri', 'verification_formelle_en_cours': 'Tri en cours',
       'verification_formelle_mise_en_demeure': 'Mise en demeure', 'css_mise_en_demeure_a_affecter': 'CSS en cours',
       'css_mise_en_demeure_a_rediger': 'CSS r\u00e9daction',
+      'css_manuels_a_affecter': 'CSS manuel', 'css_manuels_a_rediger': 'CSS man. r\u00e9dac.',
+      'css_automatiques_a_affecter': 'CSS auto', 'css_automatiques_a_rediger': 'CSS auto r\u00e9dac.',
       'instruction_a_affecter': 'Recevable',
       'instruction_recepisse_completude_a_envoyer': 'Dossier complet',
       'instruction_recepisse_completude_a_envoyer_retour_complement_a_traiter': 'Compl\u00e9ment re\u00e7u',
@@ -293,7 +440,6 @@
           '<span class="activity-dot" style="background:' + dColor + ';flex-shrink:0"></span>' +
           '<div class="mouvement-dossier-content">' +
             '<div class="mouvement-dossier-top">' +
-              '<span class="activity-hash">#' + U.escapeHtml(s.hash) + '</span>' +
               '<span class="detail-badge" style="background:' + dColor + ';font-size:0.7rem;padding:0.1rem 0.4rem">' + U.escapeHtml(s.sousEtape) + '</span>' +
             '</div>' +
             '<div class="mouvement-dossier-desc">' + U.escapeHtml(s.explication) + '</div>' +
@@ -354,15 +500,27 @@
   }
 
   function renderSdanfWait(summaries) {
-    // Tous les dossiers étape 9, les obsolètes (>20j sans vérif) affichés en dernier
-    sdanfState.all = summaries.filter(function(s) { return s.currentStep === 9; });
+    // Dossiers étape 9 + sous-statuts spécifiques étapes 10-11 (vérifs finales + PPID + IDD)
+    var EXTRA_PRE_DECRET_STATUTS = {
+      'a_verifier_avant_insertion_decret': true,
+      'prete_pour_insertion_decret': true,
+      'inseree_dans_decret': true
+    };
+    sdanfState.all = summaries.filter(function(s) {
+      if (s.currentStep === 9) return true;
+      if ((s.currentStep === 10 || s.currentStep === 11) && EXTRA_PRE_DECRET_STATUTS[(s.statut || '').toLowerCase()]) return true;
+      return false;
+    });
 
     // Populate statut filter pills
     var STATUT_PILLS = {
-      'controle_a_affecter': { label: 'Contrôle à affecter', short: 'Ctrl. à affecter', color: '#f59e0b' },
-      'controle_a_effectuer': { label: 'Contrôle à effectuer', short: 'Ctrl. à effectuer', color: '#3b82f6' },
-      'controle_en_attente_pec': { label: 'En attente PEC', short: 'Ctrl. attente PEC', color: '#8b5cf6' },
-      'controle_pec_a_faire': { label: 'PEC à faire', short: 'Ctrl. PEC à faire', color: '#8b5cf6' }
+      'controle_a_affecter': { label: 'Contrôle à affecter', short: 'À affecter', color: '#f59e0b' },
+      'controle_a_effectuer': { label: 'Contrôle à effectuer', short: 'À effectuer', color: '#3b82f6' },
+      'controle_en_attente_pec': { label: 'En attente PEC', short: 'Attente PEC', color: '#8b5cf6' },
+      'controle_pec_a_faire': { label: 'PEC à faire', short: 'PEC à faire', color: '#8b5cf6' },
+      'a_verifier_avant_insertion_decret': { label: 'Vérifs avant décret', short: 'Vérifs décret', color: '#14b8a6' },
+      'prete_pour_insertion_decret': { label: 'Prêt pour décret', short: 'Prêt décret', color: '#10b981' },
+      'inseree_dans_decret': { label: 'Inséré au décret', short: 'Inséré décret', color: '#059669' }
     };
     var statuts = {};
     var prefs = {};
@@ -450,7 +608,10 @@
       'controle_a_affecter': { short: 'Attente affectation', cls: 'orange' },
       'controle_a_effectuer': { short: 'Contr\u00f4le en cours', cls: '' },
       'controle_en_attente_pec': { short: 'Transmis SCEC', cls: 'violet' },
-      'controle_pec_a_faire': { short: 'V\u00e9rif. \u00e9tat civil', cls: 'violet' }
+      'controle_pec_a_faire': { short: 'V\u00e9rif. \u00e9tat civil', cls: 'violet' },
+      'a_verifier_avant_insertion_decret': { short: 'V\u00e9rifs avant d\u00e9cret', cls: '' },
+      'prete_pour_insertion_decret': { short: 'Pr\u00eat pour d\u00e9cret', cls: '' },
+      'inseree_dans_decret': { short: 'Ins\u00e9r\u00e9 au d\u00e9cret', cls: '' }
     };
     var kpiHtml = '<span class="kpi-bar-item"><strong>' + total + '</strong> total</span>';
     var subKeys = Object.keys(subCounts).sort(function(a, b) {
@@ -477,13 +638,16 @@
     document.getElementById('sdanf-btn-prev').disabled = sdanfState.page <= 1;
     document.getElementById('sdanf-btn-next').disabled = sdanfState.page >= totalPages;
 
-    // Render rows
+    // Render rows (étapes 9 et 10 partagent la même couleur amber)
     var color = C.STEP_COLORS[9];
     var BADGE_MAP = {
       'controle_a_affecter': { text: '9.1 Attente affectation', cls: 'badge-entretien-non' },
       'controle_a_effectuer': { text: '9.2 Contrôle en cours', cls: 'badge-entretien-non' },
       'controle_en_attente_pec': { text: '9.3 Transmis SCEC', cls: 'badge-entretien-oui' },
-      'controle_pec_a_faire': { text: '9.4 Vérif. état civil', cls: 'badge-entretien-oui' }
+      'controle_pec_a_faire': { text: '9.4 Vérif. état civil', cls: 'badge-entretien-oui' },
+      'a_verifier_avant_insertion_decret': { text: '10.6 Vérifs avant décret', cls: 'badge-entretien-oui' },
+      'prete_pour_insertion_decret': { text: '10.7 Prêt pour décret', cls: 'badge-entretien-oui' },
+      'inseree_dans_decret': { text: '11.1 Inséré au décret', cls: 'badge-entretien-oui' }
     };
     var html = '';
     for (var i = 0; i < pageData.length; i++) {
@@ -507,7 +671,7 @@
         var prevKey = s.previousStatut.toLowerCase();
         var prevInfo = C.STATUTS[prevKey];
         var prevExpl = prevInfo ? prevInfo.explication : '';
-        var prevDateStr = s.previousDateStatut ? ' depuis le ' + U.formatDateFr(s.previousDateStatut) : '';
+        var prevDateStr = s.previousDateStatut ? ' depuis le ' + U.escapeHtml(U.formatDateFr(s.previousDateStatut)) : '';
         var prevSub = prevInfo ? C.formatSubStep(prevInfo.rang) : '';
         changeHtml = '<span class="badge-status-changed">Statut modifi\u00e9</span>' +
           '<span class="meta-wrap" style="font-size:0.7rem;color:var(--text-dim)"> ancien : ' +
@@ -522,7 +686,6 @@
       html += '<div class="dossier-row dossier-clickable" style="' + staleStyle + '--card-accent:' + color + ';cursor:pointer" data-hash="' + U.escapeHtml(s.hash) + '">' +
         '<div class="dossier-row-main">' +
           '<div class="dossier-row-top">' +
-            '<span class="dossier-row-hash">#' + U.escapeHtml(s.hash) + '</span>' +
             '<span class="' + badge.cls + '">' + U.escapeHtml(badge.text) + '</span>' +
           '</div>' +
           '<div class="dossier-row-status" title="' + U.escapeHtml(s.statut) + '">' +
@@ -676,6 +839,22 @@
       case 'step-asc':
         data = data.slice().sort(function(a, b) { return a.rang - b.rang || (a.daysSinceDeposit || 0) - (b.daysSinceDeposit || 0); });
         break;
+      case 'entretien-desc':
+        data = data.slice().sort(function(a, b) {
+          if (!a.dateEntretien && !b.dateEntretien) return 0;
+          if (!a.dateEntretien) return 1;
+          if (!b.dateEntretien) return -1;
+          return b.dateEntretien.localeCompare(a.dateEntretien);
+        });
+        break;
+      case 'entretien-asc':
+        data = data.slice().sort(function(a, b) {
+          if (!a.dateEntretien && !b.dateEntretien) return 0;
+          if (!a.dateEntretien) return 1;
+          if (!b.dateEntretien) return -1;
+          return a.dateEntretien.localeCompare(b.dateEntretien);
+        });
+        break;
     }
     return data;
   }
@@ -752,7 +931,7 @@
         var prevKey = s.previousStatut.toLowerCase();
         var prevInfo = C.STATUTS[prevKey];
         var prevExpl = prevInfo ? prevInfo.explication : '';
-        var prevDateStr = s.previousDateStatut ? ' depuis le ' + U.formatDateFr(s.previousDateStatut) : '';
+        var prevDateStr = s.previousDateStatut ? ' depuis le ' + U.escapeHtml(U.formatDateFr(s.previousDateStatut)) : '';
         var prevSub = prevInfo ? C.formatSubStep(prevInfo.rang) : '';
         changeHtml = '<span class="badge-status-changed">Statut modifi\u00e9</span>' +
           '<span class="meta-wrap" style="font-size:0.7rem;color:var(--text-dim)"> ancien : ' +
@@ -773,7 +952,6 @@
       html += '<div class="dossier-row dossier-clickable" style="--card-accent:' + color + ';cursor:pointer" data-hash="' + U.escapeHtml(s.hash) + '">' +
         '<div class="dossier-row-main">' +
           '<div class="dossier-row-top">' +
-            '<span class="dossier-row-hash">#' + U.escapeHtml(s.hash) + '</span>' +
             '<span class="' + badgeClass + '">' + badgeText + '</span>' +
           '</div>' +
           '<div class="dossier-row-status" title="' + U.escapeHtml(s.statut) + '">' +
@@ -832,7 +1010,12 @@
   var SDANF_STATUTS = { 'controle_a_affecter': true, 'controle_a_effectuer': true };
   var SCEC_STATUTS = { 'controle_en_attente_pec': true, 'controle_pec_a_faire': true };
 
+  var _dailyMovCache = {};
   function computeDailyMovements(transitions, periodDays, grouped) {
+    // Mémoïsation par période : transitions/grouped sont constants sur la page,
+    // seul periodDays (0/7/30) varie. Évite jusqu'à 5 passes sur grouped
+    // (sonde hasAny + sélection période + rendu des cartes).
+    if (_dailyMovCache[periodDays]) return _dailyMovCache[periodDays];
     var now = new Date();
     var startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     var cutoff;
@@ -897,7 +1080,9 @@
       });
     }
 
-    return { caaToCAE: caaToCAE, sdanfToSCEC: sdanfToSCEC, arrivedStep9: arrivedStep9, arrivedDecret: arrivedDecret };
+    var result = { caaToCAE: caaToCAE, sdanfToSCEC: sdanfToSCEC, arrivedStep9: arrivedStep9, arrivedDecret: arrivedDecret };
+    _dailyMovCache[periodDays] = result;
+    return result;
   }
 
   function renderMouvements(transitions, grouped) {
@@ -1001,7 +1186,11 @@
     }
   }
 
-  /** Construit un objet transition-like depuis un snapshot et son précédent */
+  /**
+   * Construit un objet transition-like depuis un snapshot et son précédent.
+   * `hash` = clé du Map grouped (public_id ou dossier_hash legacy).
+   * On stocke le displayId pour permettre le lookup via findSummary(displayId).
+   */
   function snapshotToTransition(snap, prevSnap, hash) {
     var toStatut = (snap.statut || '').toLowerCase();
     var fromStatut = prevSnap ? (prevSnap.statut || '').toLowerCase() : '';
@@ -1011,7 +1200,7 @@
     var type = prevSnap ? (snap.etape === prevSnap.etape ? 'status_change' : 'step_change') : 'step_change';
     return {
       type: type,
-      hash: hash.substring(0, 6),
+      hash: D.displayIdForFullHash(hash),
       fromStep: prevSnap ? prevSnap.etape : null,
       toStep: snap.etape,
       fromStatut: fromStatut,
@@ -1132,7 +1321,6 @@
         '<span class="activity-dot" style="background:' + color + ';flex-shrink:0"></span>' +
         '<div class="mouvement-dossier-content">' +
           '<div class="mouvement-dossier-top">' +
-            '<span class="activity-hash">#' + U.escapeHtml(t.hash) + '</span>' +
             '<span class="badge-type ' + badge.css + '">' + badge.label + '</span>' +
             durHtml +
           '</div>' +
@@ -1381,6 +1569,10 @@
     var transitions = [];
 
     grouped.forEach(function(snaps, hash) {
+      // `hash` est la clé du Map (public_id ou dossier_hash legacy).
+      // On stocke le displayId (token aléatoire per-session) pour faire le lookup
+      // depuis les click handlers qui passent eux aussi des displayIds.
+      var displayId = D.displayIdForFullHash(hash);
       for (var i = 1; i < snaps.length; i++) {
         var prev = snaps[i - 1], cur = snaps[i];
         var sameStep = cur.etape === prev.etape;
@@ -1396,7 +1588,7 @@
         var type = sameStep ? 'status_change' : 'step_change';
         transitions.push({
           type: type,
-          hash: hash.substring(0, 6),
+          hash: displayId,
           fromStep: prev.etape,
           toStep: cur.etape,
           fromStatut: prev.statut ? prev.statut.toLowerCase() : '',
@@ -1416,7 +1608,7 @@
         var firstInfo = snaps[0].statut ? C.STATUTS[snaps[0].statut.toLowerCase()] : null;
         transitions.push({
           type: 'first_seen',
-          hash: hash.substring(0, 6),
+          hash: displayId,
           fromStep: null,
           toStep: snaps[0].etape,
           fromStatut: '',
@@ -1455,7 +1647,9 @@
   var ACTIVITY_BADGE = {
     first_seen:    { label: 'Nouveau',     css: 'badge-type-new' },
     step_change:   { label: 'Étape',       css: 'badge-type-step' },
-    status_change: { label: 'Progression', css: 'badge-type-progress' }
+    status_change: { label: 'Progression', css: 'badge-type-progress' },
+    deposit:       { label: 'Dépôt',       css: 'badge-type-deposit' },
+    interview:     { label: 'Entretien',   css: 'badge-type-interview' }
   };
 
   function renderActivityPage() {
@@ -1524,7 +1718,6 @@
 
       html += '<li class="activity-item activity-clickable" data-hash="' + U.escapeHtml(t.hash) + '">' +
         '<span class="activity-dot" style="background:' + color + '"></span>' +
-        '<span class="activity-hash">#' + U.escapeHtml(t.hash) + '</span>' +
         '<span class="activity-text">' + badgeHtml + text + '</span>' +
         '<span class="activity-time">' + U.formatDateTimeFr(t.created_at) + '</span>' +
         '</li>';
@@ -1622,7 +1815,8 @@
 
     if (s.dateDepot) items.push('<div class="detail-row"><span class="detail-label">D\u00e9p\u00f4t</span><span>' + U.formatDateFr(s.dateDepot) + '</span></div>');
     if (s.dateStatut) {
-      if (s.isFinished) {
+      // Étape 11 (IDD) : encore en cours, pas finalisé
+      if (s.isFinished && s.currentStep !== 11) {
         items.push('<div class="detail-row"><span class="detail-label">Finalis\u00e9 le</span><span>' + U.formatDateFr(s.dateStatut) + '</span></div>');
       } else {
         items.push('<div class="detail-row"><span class="detail-label">Statut depuis</span><span>' + U.formatDateFr(s.dateStatut) + (s.daysAtCurrentStatus != null ? ' (' + U.formatDuration(s.daysAtCurrentStatus) + ')' : '') + '</span></div>');
@@ -1644,17 +1838,48 @@
   function showDossierHistory(hash, backTo) {
     var summary = findSummary(hash);
     var history = activityState.transitions
-      .filter(function(t) { return t.hash === hash; })
-      .sort(function(a, b) {
-        // Trier par date_statut ASC (chronologie réelle du dossier)
-        var dsA = a.date_statut || '', dsB = b.date_statut || '';
-        if (dsA !== dsB) return dsA < dsB ? -1 : 1;
-        // Même date_statut → trier par étape ASC
-        var stepDiff = (a.toStep || 0) - (b.toStep || 0);
-        if (stepDiff !== 0) return stepDiff;
-        // Fallback : created_at ASC
-        return new Date(a.created_at) - new Date(b.created_at);
-      });
+      .filter(function(t) { return t.hash === hash; });
+
+    // Injecter Dépôt et Entretien comme étapes synthétiques si les dates existent.
+    // Ces étapes n'existent pas comme snapshots ANEF mais sont des jalons clés
+    // pour le dossier (date officielle de dépôt + date de l'entretien).
+    if (summary) {
+      if (summary.dateDepot) {
+        history.push({
+          type: 'deposit', hash: hash,
+          toStep: 2, toStatut: 'dossier_depose',
+          toSousEtape: '2', toExplication: 'Dossier déposé',
+          fromStep: null, fromStatut: '', fromSousEtape: null, fromExplication: null,
+          date_statut: summary.dateDepot,
+          created_at: summary.dateDepot + 'T00:00:00',
+          daysForTransition: null,
+          source: 'synthetic'
+        });
+      }
+      if (summary.dateEntretien) {
+        history.push({
+          type: 'interview', hash: hash,
+          toStep: 7, toStatut: 'ea_en_attente_ea',
+          toSousEtape: '7', toExplication: "Entretien d'assimilation",
+          fromStep: null, fromStatut: '', fromSousEtape: null, fromExplication: null,
+          date_statut: summary.dateEntretien,
+          created_at: summary.dateEntretien + 'T00:00:00',
+          daysForTransition: null,
+          source: 'synthetic'
+        });
+      }
+    }
+
+    history.sort(function(a, b) {
+      // Trier par date_statut ASC (chronologie réelle du dossier)
+      var dsA = a.date_statut || '', dsB = b.date_statut || '';
+      if (dsA !== dsB) return dsA < dsB ? -1 : 1;
+      // Même date_statut → trier par étape ASC
+      var stepDiff = (a.toStep || 0) - (b.toStep || 0);
+      if (stepDiff !== 0) return stepDiff;
+      // Fallback : created_at ASC
+      return new Date(a.created_at) - new Date(b.created_at);
+    });
 
     // Build timeline HTML
     var timelineHtml = '';
@@ -1668,16 +1893,17 @@
       var thisDateStatut = t.date_statut;
       var nextDateStatut = (i + 1 < history.length) ? history[i + 1].date_statut : null;
       var isCurrentStatus = (i === history.length - 1);
-      var dossierFinished = summary && summary.isFinished;
+      // Étape 11 (IDD) : techniquement "finished" mais encore en cours (attente JO)
+      var dossierFinished = summary && summary.isFinished && summary.currentStep !== 11;
       var timeOnStatus = null;
       if (thisDateStatut && nextDateStatut) {
         timeOnStatus = U.daysDiff(thisDateStatut, nextDateStatut);
       } else if (thisDateStatut && !nextDateStatut) {
         if (dossierFinished) {
-          // Dossier terminé : ne pas compter vers aujourd'hui
+          // Dossier clôturé : ne pas compter vers aujourd'hui
           timeOnStatus = null;
         } else {
-          // Dernier statut (en cours) : date_statut → aujourd'hui
+          // Dernier statut (en cours ou IDD en attente JO) : date_statut → aujourd'hui
           timeOnStatus = U.daysDiff(thisDateStatut, now);
         }
       }
@@ -1689,7 +1915,13 @@
       }
 
       var desc;
-      if (t.type === 'first_seen') {
+      if (t.type === 'deposit') {
+        desc = '\uD83D\uDCE8 D\u00e9p\u00f4t du dossier' +
+          '<br><span class="history-detail">Date officielle de d\u00e9p\u00f4t enregistr\u00e9e par l\'ANEF</span>';
+      } else if (t.type === 'interview') {
+        desc = '\uD83D\uDDE3\uFE0F Entretien d\'assimilation' +
+          '<br><span class="history-detail">Date de l\'entretien d\'assimilation</span>';
+      } else if (t.type === 'first_seen') {
         desc = 'Premi\u00e8re observation \u2014 \u00e9tape ' + t.toSousEtape +
           '<br><span class="history-detail">' + U.escapeHtml(t.toExplication || '') + '</span>' +
           '<br><span class="statut-code">(' + U.escapeHtml(t.toStatut.toUpperCase()) + ')</span>';
@@ -1762,7 +1994,7 @@
       '<div class="history-modal">' +
         '<div class="history-modal-header">' +
           backBtnHtml +
-          '<h3>Dossier #' + U.escapeHtml(hash) + '</h3>' +
+          '<h3>Détails du dossier</h3>' +
           '<button class="history-close" title="Fermer">\u00d7</button>' +
         '</div>' +
         '<div class="modal-history-list">' +
@@ -1787,7 +2019,7 @@
         } else if (backTo.timelineBubble) {
           // Re-trigger the timeline bubble click to reopen its modal
           var tb = backTo.timelineBubble;
-          var bubble = wrapper.querySelector('.station-sub-bubble[data-step="' + tb.step + '"][data-statut="' + tb.statut + '"]');
+          var bubble = _timelineWrapper && _timelineWrapper.querySelector('.station-sub-bubble[data-step="' + tb.step + '"][data-statut="' + tb.statut + '"]');
           if (bubble) bubble.click();
         }
       });
@@ -1797,7 +2029,71 @@
     modal.classList.add('open');
   }
 
+  // ─── Liste de tous les décrets ──────────────────────────
+
+  function showAllDecrets(decretMap) {
+    _allDecretMap = decretMap;
+    var keys = Object.keys(decretMap).sort(sortDecretNum).reverse(); // plus récent en premier
+    var html = '';
+
+    for (var k = 0; k < keys.length; k++) {
+      var num = keys[k];
+      var dossiers = decretMap[num];
+      var pub = isDecretPublished(dossiers);
+      var itemCls = pub ? 'decret-list-item is-published' : 'decret-list-item is-pending';
+      var badgeCls = pub ? 'decret-status decret-status-pub' : 'decret-status decret-status-pending';
+      var badgeTxt = pub ? 'Publi\u00e9 au JO' : 'En attente JO';
+      html += '<div class="' + itemCls + '" data-decret="' + U.escapeHtml(num) + '">' +
+        '<div class="decret-list-left">' +
+          '<span class="decret-list-num">' + U.escapeHtml(num) + '</span>' +
+          '<span class="decret-list-count">' + dossiers.length + ' dossier' + (dossiers.length > 1 ? 's' : '') + '</span>' +
+        '</div>' +
+        '<span class="decret-list-status-wrap"><span class="' + badgeCls + '">' + badgeTxt + '</span></span>' +
+        '<span class="mouvement-chevron">\u203a</span>' +
+      '</div>';
+    }
+
+    var modal = document.getElementById('all-decrets-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'all-decrets-modal';
+      modal.className = 'history-modal-overlay';
+      modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('open');
+      });
+      document.body.appendChild(modal);
+    }
+
+    modal.innerHTML =
+      '<div class="history-modal">' +
+        '<div class="history-modal-header">' +
+          '<h3>D\u00e9crets de naturalisation</h3>' +
+          '<button class="history-close">\u00d7</button>' +
+        '</div>' +
+        '<div class="history-modal-body">' + html + '</div>' +
+      '</div>';
+
+    modal.querySelector('.history-close').addEventListener('click', function() {
+      modal.classList.remove('open');
+    });
+
+    // Clic sur un décret → ouvre la liste des dossiers
+    var items = modal.querySelectorAll('.decret-list-item');
+    for (var i = 0; i < items.length; i++) {
+      items[i].addEventListener('click', (function(num) {
+        return function() {
+          modal.classList.remove('open');
+          showDecretDossiers(num, decretMap[num]);
+        };
+      })(items[i].getAttribute('data-decret')));
+    }
+
+    modal.classList.add('open');
+  }
+
   // ─── Décret Dossiers Popup ──────────────────────────────
+
+  var _allDecretMap = null; // conservé pour le retour
 
   function showDecretDossiers(decretNum, dossiers) {
     var html = '';
@@ -1833,18 +2129,29 @@
       document.body.appendChild(modal);
     }
 
+    var backBtn = _allDecretMap ? '<button class="history-back" title="Retour aux d\u00e9crets">\u2190</button>' : '';
+
     modal.innerHTML =
       '<div class="history-modal">' +
         '<div class="history-modal-header">' +
+          backBtn +
           '<h3>D\u00e9cret ' + U.escapeHtml(decretNum) + ' \u2014 ' + dossiers.length + ' dossier' + (dossiers.length > 1 ? 's' : '') + '</h3>' +
           '<button class="history-close" title="Fermer">\u00d7</button>' +
         '</div>' +
-        '<div class="modal-history-list mouvement-dossier-list">' + html + '</div>' +
+        '<div class="history-modal-body modal-history-list mouvement-dossier-list">' + html + '</div>' +
       '</div>';
 
     modal.querySelector('.history-close').addEventListener('click', function() {
       modal.classList.remove('open');
     });
+
+    var back = modal.querySelector('.history-back');
+    if (back) {
+      back.addEventListener('click', function() {
+        modal.classList.remove('open');
+        showAllDecrets(_allDecretMap);
+      });
+    }
 
     var items = modal.querySelectorAll('.mouvement-dossier-item');
     for (var j = 0; j < items.length; j++) {

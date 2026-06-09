@@ -54,7 +54,9 @@
   }
 
   /** Fetch all snapshots from Supabase REST API (with pagination) — fallback */
-  var _COLUMNS = 'dossier_hash,statut,etape,phase,date_depot,date_statut,date_entretien,prefecture,domicile_code_postal,lieu_entretien,numero_decret,has_complement,source,created_at,checked_at';
+  // public_id = HMAC(secret serveur, dossier_hash) — opaque, non-reversible.
+  // dossier_hash retiré du select public pour éviter rainbow tables sur les numéros de dossier.
+  var _COLUMNS = 'public_id,statut,etape,phase,date_depot,date_statut,date_entretien,prefecture,domicile_code_postal,lieu_entretien,numero_decret,has_complement,source,created_at,checked_at';
 
   async function fetchFromSupabase() {
     var PAGE_SIZE = 1000;
@@ -169,13 +171,18 @@
     return cleaned;
   }
 
-  /** Group snapshots by dossier_hash => Map<hash, snapshot[]> */
+  /** Clé d'identité de dossier : public_id (nouveau JSON) ou dossier_hash (legacy). */
+  function _dossierKey(s) { return s.public_id || s.dossier_hash; }
+
+  /** Group snapshots by dossier identity => Map<key, snapshot[]> */
   function groupByDossier(snapshots) {
     var map = new Map();
     for (var i = 0; i < snapshots.length; i++) {
       var s = snapshots[i];
-      if (!map.has(s.dossier_hash)) map.set(s.dossier_hash, []);
-      map.get(s.dossier_hash).push(s);
+      var k = _dossierKey(s);
+      if (!k) continue;
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push(s);
     }
     map.forEach(function(snaps, hash) {
       // Normaliser les statuts en minuscules pour éviter les doublons auto/manual
@@ -212,9 +219,56 @@
           deduped.push(cur);
         }
       }
+      // Filet de sécurité ciblé contre la contamination cross-dossier
+      // (cas 2213db6be...) : on retire UNIQUEMENT un "pic d'étape" isolé —
+      // un snapshot dont l'étape est strictement supérieure à ses voisins
+      // ET dont la transition aller-retour est physiquement impossible
+      // (ex: étape 11 suivie d'étape < 10 = régression vers contrôle/préf).
+      //
+      // Cas préservés (légitimes) :
+      // - Rectification manuelle en avance sur l'auto (user annonce sa publication)
+      // - Backtracking ANEF normal entre steps 9 ↔ 10 (préparation décret)
+      // - Fin de trajectoire (dernier snapshot, pas de "suivant")
+      var out = [];
+      for (var ci = 0; ci < deduped.length; ci++) {
+        var cur2 = deduped[ci];
+        var prev2 = ci > 0 ? deduped[ci - 1] : null;
+        var next2 = ci < deduped.length - 1 ? deduped[ci + 1] : null;
+        // Pic suspect = étape bien plus haute que prev ET suivie d'une régression profonde
+        var isPhantomPeak = prev2 && next2
+          && (cur2.etape || 0) >= 11
+          && (next2.etape || 0) < 10
+          && (cur2.etape - prev2.etape) >= 3;
+        if (!isPhantomPeak) out.push(cur2);
+      }
+      deduped = out;
       map.set(hash, deduped);
     });
     return map;
+  }
+
+  // Identifiant d'affichage opaque (random per-session) pour éviter
+  // que le hash SHA-256 du dossier soit visible / reversible via l'UI.
+  // fullHash reste en interne (clé de state.grouped) mais n'est jamais
+  // rendu dans le DOM ni dans un attribut data-*.
+  var _displayIdByFullHash = Object.create(null);
+  var _usedDisplayIds = new Set();
+  function generateDisplayId() {
+    // 5 chars base36 : ~60M combinaisons, collisions négligeables (<10k dossiers)
+    // Unicité vérifiée via un Set => O(1) par génération (évite un scan O(D²)).
+    var id;
+    do {
+      id = Math.random().toString(36).substring(2, 7).padEnd(5, '0');
+    } while (_usedDisplayIds.has(id));
+    _usedDisplayIds.add(id);
+    return id;
+  }
+  function displayIdForFullHash(fullHash) {
+    if (!fullHash) return '';
+    if (!_displayIdByFullHash[fullHash]) {
+      _displayIdByFullHash[fullHash] = generateDisplayId();
+    }
+    return _displayIdByFullHash[fullHash];
   }
 
   /** Compute dossier summaries from grouped data */
@@ -227,8 +281,11 @@
     grouped.forEach(function(snaps, hash) {
       var latest = snaps[snaps.length - 1];
       var finished = ANEF.constants.isFinished({ etape: latest.etape, statut: latest.statut });
-      // Dossiers terminés : figer la durée à la date du dernier statut (pas today)
-      var endDate = finished && latest.date_statut ? new Date(latest.date_statut + 'T00:00:00') : today;
+      // Dossiers clôturés : figer la durée à la date du dernier statut (pas today)
+      // Exception : étape 11 (IDD — inséré dans décret, en attente JO) reste en cours,
+      // le compteur doit continuer car le dossier n'est pas publié au JO.
+      var freezeDuration = finished && latest.etape !== 11 && latest.date_statut;
+      var endDate = freezeDuration ? new Date(latest.date_statut + 'T00:00:00') : today;
       var daysAtStatus = latest.date_statut ? ANEF.utils.daysDiff(latest.date_statut, endDate) : null;
       var daysSinceDeposit = latest.date_depot ? ANEF.utils.daysDiff(latest.date_depot, endDate) : null;
 
@@ -287,7 +344,7 @@
       }
 
       summaries.push({
-        hash: hash.substring(0, 6),
+        hash: displayIdForFullHash(hash),
         fullHash: hash,
         currentStep: latest.etape,
         currentPhase: latest.phase || PHASE_NAMES[latest.etape] || 'Inconnu',
@@ -362,42 +419,74 @@
     }).sort(function(a, b) { return a.etape - b.etape; });
   }
 
-  /** Duration by status — like computeDurationByStep but splits step 9 into 4 sub-statuts */
+  /** Duration by status — like computeDurationByStep but splits step 9 into 4 sub-statuts.
+   *  For each dossier × step, keep only the EARLIEST observed date_statut (= arrival
+   *  at that step). One data point per (dossier, step) — no double-counting dossiers
+   *  with many identical snapshots, and earlier steps benefit from historical snapshots
+   *  of dossiers that have since progressed. */
   var STEP9_STATUTS = ['controle_a_affecter', 'controle_a_effectuer', 'controle_en_attente_pec', 'controle_pec_a_faire'];
 
-  function computeDurationByStatus(snapshots) {
+  function _bucketKeyFor(s) {
     var STATUTS = ANEF.constants.STATUTS;
     var PHASE_NAMES = ANEF.constants.PHASE_NAMES;
+    var statutLower = s.statut ? s.statut.toLowerCase() : '';
+    if (Number(s.etape) === 9 && statutLower && STEP9_STATUTS.indexOf(statutLower) !== -1) {
+      var info = STATUTS[statutLower];
+      return {
+        key: 'statut:' + statutLower,
+        rang: info ? info.rang : (s.etape * 100),
+        phase: info ? info.phase : PHASE_NAMES[s.etape],
+        statut: statutLower
+      };
+    }
+    return {
+      key: 'etape:' + s.etape,
+      rang: s.etape * 100,
+      phase: s.phase || PHASE_NAMES[s.etape],
+      statut: null
+    };
+  }
+
+  // NB: opère sur les snapshots BRUTS (non dédupliqués) — comportement historique,
+  // distinct de computeStepWaitTimes qui prend le Map dédupliqué. Ne pas « optimiser »
+  // en passant le grouped : la déduplication changerait les statistiques affichées.
+  function computeDurationByStatus(snapshots) {
     var buckets = {};
 
+    // Group snapshots by dossier
+    var byDossier = {};
     for (var i = 0; i < snapshots.length; i++) {
       var s = snapshots[i];
-      if (!s.date_depot || !s.date_statut) continue;
-      var days = ANEF.utils.daysDiff(s.date_depot, s.date_statut);
-      if (days === null || days < 0) continue;
-
-      var key, rang, phase;
-      var statutLower = s.statut ? s.statut.toLowerCase() : '';
-      if (Number(s.etape) === 9 && statutLower && STEP9_STATUTS.indexOf(statutLower) !== -1) {
-        // Split step 9 by statut
-        key = 'statut:' + statutLower;
-        var info = STATUTS[statutLower];
-        rang = info ? info.rang : (s.etape * 100);
-        phase = info ? info.phase : PHASE_NAMES[s.etape];
-      } else {
-        // Group by etape
-        key = 'etape:' + s.etape;
-        rang = s.etape * 100;
-        phase = s.phase || PHASE_NAMES[s.etape];
-      }
-
-      if (!buckets[key]) buckets[key] = { etape: Number(s.etape), phase: phase, statut: null, rang: rang, days: [] };
-      buckets[key].days.push(days);
-      // Store statut for step 9 sub-entries
-      if (Number(s.etape) === 9 && statutLower && STEP9_STATUTS.indexOf(statutLower) !== -1) {
-        buckets[key].statut = statutLower;
-      }
+      var k = _dossierKey(s);
+      if (!s.date_depot || !s.date_statut || !k) continue;
+      if (!byDossier[k]) byDossier[k] = [];
+      byDossier[k].push(s);
     }
+
+    // For each dossier, take the earliest date_statut per (step or step9-substatut)
+    Object.keys(byDossier).forEach(function(hash) {
+      var snaps = byDossier[hash];
+      var earliestByKey = {};
+
+      for (var j = 0; j < snaps.length; j++) {
+        var s = snaps[j];
+        var meta = _bucketKeyFor(s);
+        var prev = earliestByKey[meta.key];
+        if (!prev || s.date_statut < prev.snap.date_statut) {
+          earliestByKey[meta.key] = { snap: s, meta: meta };
+        }
+      }
+
+      Object.keys(earliestByKey).forEach(function(k) {
+        var entry = earliestByKey[k];
+        var s = entry.snap;
+        var days = ANEF.utils.daysDiff(s.date_depot, s.date_statut);
+        if (days === null || days < 0) return;
+
+        if (!buckets[k]) buckets[k] = { etape: Number(s.etape), phase: entry.meta.phase, statut: entry.meta.statut, rang: entry.meta.rang, days: [] };
+        buckets[k].days.push(days);
+      });
+    });
 
     return Object.keys(buckets).map(function(key) {
       var b = buckets[key];
@@ -467,6 +556,47 @@
     }).sort(function(a, b) { return b.total - a.total; });
   }
 
+  /** Time spent AT each step (not cumulative). For each consecutive pair in a
+   *  dossier's snapshot history, count days as "time spent at the previous step
+   *  before transitioning". Step 9 split by sub-statut. Only observed transitions
+   *  — ongoing waits aren't counted. */
+  function computeStepWaitTimes(grouped) {
+    var buckets = {};
+
+    grouped.forEach(function(snaps) {
+      if (!snaps || snaps.length < 2) return;
+      for (var i = 1; i < snaps.length; i++) {
+        var prev = snaps[i - 1];
+        var curr = snaps[i];
+        if (!prev.date_statut || !curr.date_statut) continue;
+        var prevMeta = _bucketKeyFor(prev); // calculé une seule fois (était 2×)
+        var currKey = _bucketKeyFor(curr).key;
+        if (prevMeta.key === currKey) continue; // same bucket, not a transition
+        var days = ANEF.utils.daysDiff(prev.date_statut, curr.date_statut);
+        if (days === null || days < 0) continue;
+
+        if (!buckets[prevMeta.key]) buckets[prevMeta.key] = { etape: Number(prev.etape), phase: prevMeta.phase, statut: prevMeta.statut, rang: prevMeta.rang, days: [] };
+        buckets[prevMeta.key].days.push(days);
+      }
+    });
+
+    return Object.keys(buckets).map(function(key) {
+      var b = buckets[key];
+      var sum = 0;
+      for (var j = 0; j < b.days.length; j++) sum += b.days[j];
+      return {
+        etape: b.etape,
+        phase: b.phase,
+        statut: b.statut,
+        rang: b.rang,
+        avg_days: ANEF.utils.round1(sum / b.days.length),
+        median_days: ANEF.utils.round1(ANEF.utils.medianCalc(b.days)),
+        count: b.days.length,
+        days: b.days
+      };
+    }).sort(function(a, b) { return a.rang - b.rang; });
+  }
+
   /** Compute transitions from grouped data */
   function computeTransitions(grouped) {
     var transitions = {};
@@ -503,8 +633,8 @@
         to_phase: t.to_phase,
         avg_days: ANEF.utils.round1(sum / t.days.length),
         median_days: ANEF.utils.round1(ANEF.utils.medianCalc(t.days)),
-        min_days: Math.min.apply(null, t.days),
-        max_days: Math.max.apply(null, t.days),
+        min_days: t.days.length ? Math.min.apply(null, t.days) : null,
+        max_days: t.days.length ? Math.max.apply(null, t.days) : null,
         count: t.days.length,
         days: t.days
       };
@@ -545,19 +675,19 @@
         if (filters.complement === 'with' && !s.hasComplement) return false;
         if (filters.complement === 'without' && s.hasComplement) return false;
       }
-      // Search by hash
+      // Search by displayId (hash SHA-256 non recherchable — opaque pour privacy)
       if (filters.search) {
         var q = filters.search.toLowerCase();
-        if (s.hash.toLowerCase().indexOf(q) === -1 && s.fullHash.toLowerCase().indexOf(q) === -1) return false;
+        if (s.hash.toLowerCase().indexOf(q) === -1) return false;
       }
       return true;
     });
   }
 
-  /** Get snapshots for a set of hashes */
+  /** Get snapshots for a set of dossier keys (public_id ou dossier_hash legacy) */
   function getSnapshotsForHashes(snapshots, hashes) {
     var set = new Set(hashes);
-    return snapshots.filter(function(s) { return set.has(s.dossier_hash); });
+    return snapshots.filter(function(s) { return set.has(_dossierKey(s)); });
   }
 
   /** Get unique prefectures from summaries */
@@ -576,12 +706,14 @@
     computePhaseDistribution: computePhaseDistribution,
     computeDurationByStep: computeDurationByStep,
     computeDurationByStatus: computeDurationByStatus,
+    computeStepWaitTimes: computeStepWaitTimes,
     STEP9_STATUTS: STEP9_STATUTS,
     computePrefectureStats: computePrefectureStats,
     computeTransitions: computeTransitions,
     applyFilters: applyFilters,
     getSnapshotsForHashes: getSnapshotsForHashes,
     getUniquePrefectures: getUniquePrefectures,
-    normalizePrefecture: normalizePrefecture
+    normalizePrefecture: normalizePrefecture,
+    displayIdForFullHash: displayIdForFullHash
   };
 })();

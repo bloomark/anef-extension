@@ -49,6 +49,12 @@
       state.snapshots = snapshots;
       state.grouped = D.groupByDossier(snapshots);
       state.summaries = D.computeDossierSummaries(state.grouped);
+      // Index hash → summary : lookups O(1) au lieu d'un scan O(N) par appel
+      // (le modal d'étape pouvait faire O(dossiers × N) = O(N²)).
+      state.summaryByHash = new Map();
+      for (var _si = 0; _si < state.summaries.length; _si++) {
+        state.summaryByHash.set(state.summaries[_si].hash, state.summaries[_si]);
+      }
 
       var urlFilters = F.readFiltersFromURL();
       if (urlFilters.sort) state.sort = urlFilters.sort;
@@ -70,10 +76,19 @@
   });
 
   function initSectionFilters(prefectures) {
+    // Statuts effectivement présents dans les dossiers — évite de proposer
+    // des statuts (ex. "dossier_depose") jamais atteints par les snapshots.
+    var availableStatuses = {};
+    for (var si = 0; si < state.summaries.length; si++) {
+      var st = (state.summaries[si].statut || '').toLowerCase();
+      if (st) availableStatuses[st] = true;
+    }
+    var availableList = Object.keys(availableStatuses);
+
     // Parcours des dossiers: statut + prefecture
     F.createStatusFilter('dossier-filter-statut-container', 'all', function(v) {
       state.dossierFilters.statut = v; state.page = 1; renderAll();
-    });
+    }, { filterStatuses: availableList });
     F.createSearchablePrefectureDropdown('dossier-filter-prefecture-container', prefectures, '', function(v) {
       state.dossierFilters.prefecture = v || 'all'; state.page = 1; renderAll();
     });
@@ -81,7 +96,7 @@
     // Histogram: statut + prefecture
     F.createStatusFilter('histogram-filter-statut-container', 'all', function(v) {
       state.histogramFilters.statut = v; renderAll();
-    });
+    }, { filterStatuses: availableList });
     F.createSearchablePrefectureDropdown('histogram-filter-prefecture-container', prefectures, '', function(v) {
       state.histogramFilters.prefecture = v || 'all'; renderAll();
     });
@@ -196,13 +211,28 @@
     });
   }
 
+  // Liste filtrée+triée mise en cache par signature (filtres dossier + tri).
+  // La pagination ne dépend QUE de state.page/pageSize → pas besoin de re-filtrer
+  // ni re-trier 5000+ dossiers à chaque clic de page. Recalcul seulement si la
+  // signature change (un filtre ou le tri a bougé).
+  function getFilteredSorted(allSummaries) {
+    var tf = state.dossierFilters;
+    var sig = [tf.statut, tf.prefecture, tf.history, tf.depotMin, tf.depotMax,
+               tf.statutDateMin, tf.statutDateMax, state.sort].join('|');
+    if (state._sortedCache && state._sortedSig === sig) return state._sortedCache;
+    var sorted = getSorted(applyDossierFilters(allSummaries));
+    state._sortedCache = sorted;
+    state._sortedSig = sig;
+    return sorted;
+  }
+
   function renderDossiers(allSummaries) {
-    var dossierData = applyDossierFilters(allSummaries);
+    var sorted = getFilteredSorted(allSummaries);
     var toolbar = document.getElementById('dossier-toolbar');
     var grid = document.getElementById('dossier-grid');
     var list = document.getElementById('dossier-list');
 
-    if (!dossierData.length) {
+    if (!sorted.length) {
       toolbar.style.display = 'none';
       grid.innerHTML = '';
       grid.style.display = 'none';
@@ -211,7 +241,6 @@
       return;
     }
 
-    var sorted = getSorted(dossierData);
     var totalPages = Math.max(1, Math.ceil(sorted.length / state.pageSize));
     state.page = Math.min(state.page, totalPages);
 
@@ -252,31 +281,33 @@
       var s = pageData[i];
       var color = C.getStepColor(s.currentStep);
       var daysAtStatus, totalDuration;
-      if (s.isFinished) {
-        daysAtStatus = s.dateStatut ? U.formatDateFr(s.dateStatut) : 'Termin\u00e9';
+      // Étape 11 (IDD) : techniquement "finished" mais encore en cours (attente JO) → afficher comme "en cours"
+      var displayAsInProgress = !s.isFinished || s.currentStep === 11;
+      if (displayAsInProgress) {
+        daysAtStatus = s.daysAtCurrentStatus != null ? U.formatDuration(s.daysAtCurrentStatus) : '\u2014';
         totalDuration = s.daysSinceDeposit != null ? U.formatDuration(s.daysSinceDeposit) : '\u2014';
       } else {
-        daysAtStatus = s.daysAtCurrentStatus != null ? U.formatDuration(s.daysAtCurrentStatus) : '\u2014';
+        daysAtStatus = s.dateStatut ? U.formatDateFr(s.dateStatut) : 'Termin\u00e9';
         totalDuration = s.daysSinceDeposit != null ? U.formatDuration(s.daysSinceDeposit) : '\u2014';
       }
 
       var triBadge = s.currentStep === 3 ? ' <span class="badge-tri">Tri</span>' : '';
       var sansEntretien = s.currentStep === 8 && !s.dateEntretien && s.stepsTraversed.indexOf(7) === -1;
       var sansEntretienBadge = sansEntretien ? ' <span class="badge-decision-sans-entretien">\u26A0 Sans entretien</span>' : '';
-      var finishedBadge = s.isFinished ? (C.isPositiveStatus(s.statut) || s.currentStep === 11 ? ' <span class="badge-finished-ok">\u2713 Termin\u00e9</span>' : ' <span class="badge-finished-ko">\u2717 Cl\u00f4tur\u00e9</span>') : '';
+      // Badge "Terminé/Clôturé" uniquement si vraiment clôturé (pas pour IDD étape 11)
+      var finishedBadge = (s.isFinished && s.currentStep !== 11) ? (C.isPositiveStatus(s.statut) ? ' <span class="badge-finished-ok">\u2713 Termin\u00e9</span>' : ' <span class="badge-finished-ko">\u2717 Cl\u00f4tur\u00e9</span>') : '';
 
       html += '<div class="dossier-row" style="--card-accent:' + color + '" data-row-idx="' + i + '">' +
         '<div class="dossier-row-main">' +
           '<div class="dossier-row-top">' +
             '<span class="dossier-row-step" style="background:' + color + '">' + s.sousEtape + '/12</span>' +
-            '<span class="dossier-row-hash">#' + U.escapeHtml(s.hash) + '</span>' +
           '</div>' +
           '<div class="dossier-row-status" title="' + U.escapeHtml(s.statut) + '">' +
             '<span class="statut-label">' + U.escapeHtml(s.sousEtape + ' \u2014 ' + s.explication) + '</span>' +
             triBadge + sansEntretienBadge + finishedBadge +
           '</div>' +
           '<div class="dossier-row-meta">' +
-            '<span>' + (s.isFinished ? daysAtStatus : daysAtStatus + ' au statut') + '</span>' +
+            '<span>' + (displayAsInProgress ? daysAtStatus + ' au statut' : daysAtStatus) + '</span>' +
             '<span>' + totalDuration + ' total</span>' +
             (s.prefecture ? '<span>' + U.escapeHtml(s.prefecture) + '</span>' : '') +
             (s.hasComplement ? '<span style="color:var(--orange)">Complément</span>' : '') +
@@ -311,10 +342,64 @@
 
   function buildStatusTimeline(snaps) {
     if (!snaps || !snaps.length) return '';
+
+    // Enrichir avec jalons synthétiques : Dépôt + Entretien (si dates connues).
+    // Un clone du tableau pour ne pas muter la source.
+    var events = snaps.slice();
+    var first = snaps[0] || {};
+    var dateDepot = first.date_depot || null;
+    var dateEntretien = null;
+    for (var ei = 0; ei < snaps.length; ei++) {
+      if (snaps[ei].date_entretien) { dateEntretien = snaps[ei].date_entretien; break; }
+    }
+    if (dateDepot) {
+      events.push({ _synthetic: 'deposit', date_statut: dateDepot, etape: 2 });
+    }
+    if (dateEntretien) {
+      events.push({ _synthetic: 'interview', date_statut: dateEntretien, etape: 7 });
+    }
+    events.sort(function(a, b) {
+      var da = a.date_statut || '', db = b.date_statut || '';
+      if (da !== db) return da < db ? -1 : 1;
+      return (a.etape || 0) - (b.etape || 0);
+    });
+
     var html = '<div style="margin-top:0.75rem;padding-top:0.6rem">' +
       '<div class="detail-history-header">Historique des statuts</div>';
-    for (var j = 0; j < snaps.length; j++) {
-      var snap = snaps[j];
+    for (var j = 0; j < events.length; j++) {
+      var snap = events[j];
+
+      if (snap._synthetic === 'deposit' || snap._synthetic === 'interview') {
+        var synthLabel = snap._synthetic === 'deposit' ? '📨 Dépôt du dossier' : '🗣️ Entretien d\'assimilation';
+        var synthExpl = snap._synthetic === 'deposit'
+          ? 'Date officielle de dépôt'
+          : 'Date de l\'entretien d\'assimilation';
+        var synthColor = snap._synthetic === 'deposit' ? '#06b6d4' : '#f472b6';
+        var synthDate = snap.date_statut ? U.formatDateFr(snap.date_statut) : '';
+        // Durée jusqu'au prochain événement
+        var synthDur = '';
+        if (j < events.length - 1) {
+          var nextEv = events[j + 1];
+          var dd = (snap.date_statut && nextEv.date_statut) ? U.daysDiff(snap.date_statut, nextEv.date_statut) : null;
+          if (dd !== null) {
+            synthDur = '<span class="ts-duration" style="color:var(--text-dim);background:rgba(148,163,184,0.1)">' + U.formatDuration(dd) + ' jusqu\'au suivant</span>';
+          }
+        }
+        html += '<div class="timeline-step">' +
+          '<div class="timeline-dot-col">' +
+            '<div class="timeline-dot" style="background:' + synthColor + '"></div>' +
+            (j < events.length - 1 ? '<div class="timeline-line"></div>' : '') +
+          '</div>' +
+          '<div class="timeline-content">' +
+            '<div class="ts-status" style="color:' + synthColor + '">' + synthLabel + '</div>' +
+            '<div class="ts-expl">' + synthExpl + '</div>' +
+            (synthDate ? '<div class="ts-date">' + synthDate + '</div>' : '') +
+            synthDur +
+          '</div>' +
+        '</div>';
+        continue;
+      }
+
       var statutKey = (snap.statut || '').toLowerCase();
       var info = C.STATUTS[statutKey];
       var stepColor = C.STEP_COLORS[snap.etape] || '#64748b';
@@ -322,8 +407,8 @@
       var sousEtape = info ? C.formatSubStep(info.rang) : String(snap.etape);
 
       var durationHtml = '';
-      if (j < snaps.length - 1) {
-        var nextSnap = snaps[j + 1];
+      if (j < events.length - 1) {
+        var nextSnap = events[j + 1];
         var days = null;
         if (snap.date_statut && nextSnap.date_statut) {
           days = U.daysDiff(snap.date_statut, nextSnap.date_statut);
@@ -338,12 +423,13 @@
           durationHtml = '<span class="ts-duration" style="color:' + dColor + '">' + U.formatDuration(days) + ' \u00e0 ce statut</span>';
         }
       } else {
-        var isTerminated = C.isFinished({ etape: snap.etape, statut: snap.statut });
+        // Étape 11 (IDD) : encore en cours, pas figé
+        var isTerminated = C.isFinished({ etape: snap.etape, statut: snap.statut }) && Number(snap.etape) !== 11;
         if (isTerminated) {
           durationHtml = '<span class="ts-duration" style="color:var(--green);background:rgba(16,185,129,0.12)">\u2705 Termin\u00e9</span>';
         } else {
           var today = new Date(); today.setHours(0, 0, 0, 0);
-          var days = snap.date_statut ? U.daysDiff(snap.date_statut, today) : null;
+          days = snap.date_statut ? U.daysDiff(snap.date_statut, today) : null;
           if (!days && snap.created_at) {
             days = U.daysDiff(snap.created_at, today);
           }
@@ -358,7 +444,7 @@
       html += '<div class="timeline-step">' +
         '<div class="timeline-dot-col">' +
           '<div class="timeline-dot" style="background:' + stepColor + '"></div>' +
-          (j < snaps.length - 1 ? '<div class="timeline-line"></div>' : '') +
+          (j < events.length - 1 ? '<div class="timeline-line"></div>' : '') +
         '</div>' +
         '<div class="timeline-content">' +
           '<div class="ts-status">' + U.escapeHtml(sousEtape) + ' \u2014 ' + U.escapeHtml(statutKey) + '</div>' +
@@ -395,7 +481,9 @@
     }
 
     var daysAtStatus, totalDuration, durationLabel;
-    if (s.isFinished) {
+    // Étape 11 (IDD) : techniquement "finished" mais encore en cours (attente JO)
+    var displayAsFinished = s.isFinished && s.currentStep !== 11;
+    if (displayAsFinished) {
       daysAtStatus = s.dateStatut ? U.formatDateFr(s.dateStatut) : 'Termin\u00e9';
       durationLabel = 'Finalis\u00e9 le';
     } else {
@@ -474,7 +562,6 @@
 
     return '<div class="dossier-card" style="--card-accent:' + color + '">' +
       '<div class="dossier-header">' +
-        '<span class="dossier-hash">#' + U.escapeHtml(s.hash) + '</span>' +
         '<span class="dossier-step-badge" style="background:' + color + '">' + s.sousEtape + '/12</span>' +
       '</div>' +
       '<div class="dossier-progress">' +
@@ -505,8 +592,7 @@
       if (state.page > 1) { state.page--; renderAll(); }
     });
     document.getElementById('btn-next').addEventListener('click', function() {
-      var dossierData = applyDossierFilters(state.summaries);
-      var totalPages = Math.ceil(dossierData.length / state.pageSize);
+      var totalPages = Math.ceil(getFilteredSorted(state.summaries).length / state.pageSize);
       if (state.page < totalPages) { state.page++; renderAll(); }
     });
   }
@@ -526,10 +612,11 @@
    */
   function computeDurationAtStep(grouped) {
     var STATUTS = C.STATUTS;
-    var STEP9 = D.STEP9_STATUTS;
     var buckets = {};
 
     grouped.forEach(function(snaps) {
+      var k = snaps[0] ? (snaps[0].public_id || snaps[0].dossier_hash) : '';
+      var hash = D.displayIdForFullHash(k);
       for (var i = 0; i < snaps.length - 1; i++) {
         var curr = snaps[i];
         var next = snaps[i + 1];
@@ -539,23 +626,15 @@
         var days = U.daysDiff(curr.date_statut, next.date_statut);
         if (days === null || days < 0) continue;
 
-        var key, rang, phase, statut = null;
         var statutLower = curr.statut ? curr.statut.toLowerCase() : '';
+        var key = 'statut:' + statutLower;
+        var info = STATUTS[statutLower];
+        var rang = info ? info.rang : (Number(curr.etape) * 100);
+        var phase = info ? info.phase : (curr.phase || C.PHASE_NAMES[curr.etape]);
 
-        if (Number(curr.etape) === 9 && statutLower && STEP9.indexOf(statutLower) !== -1) {
-          key = 'statut:' + statutLower;
-          var info = STATUTS[statutLower];
-          rang = info ? info.rang : (curr.etape * 100);
-          phase = info ? info.phase : C.PHASE_NAMES[curr.etape];
-          statut = statutLower;
-        } else {
-          key = 'etape:' + curr.etape;
-          rang = curr.etape * 100;
-          phase = curr.phase || C.PHASE_NAMES[curr.etape];
-        }
-
-        if (!buckets[key]) buckets[key] = { etape: Number(curr.etape), phase: phase, statut: statut, rang: rang, days: [] };
+        if (!buckets[key]) buckets[key] = { etape: Number(curr.etape), phase: phase, statut: statutLower, rang: rang, explication: info ? info.explication : '', days: [], dossiers: [] };
         buckets[key].days.push(days);
+        buckets[key].dossiers.push({ hash: hash, days: days, dateFrom: curr.date_statut, dateTo: next.date_statut });
       }
     });
 
@@ -569,13 +648,15 @@
         phase: b.phase,
         statut: b.statut,
         rang: b.rang,
+        explication: b.explication,
         median_days: U.round1(U.medianCalc(b.days)),
         avg_days: U.round1(sum / sorted.length),
         min_days: sorted[0],
         max_days: sorted[sorted.length - 1],
         p25_days: M.percentile(sorted, 25),
         p75_days: M.percentile(sorted, 75),
-        count: b.days.length
+        count: b.days.length,
+        dossiers: b.dossiers
       };
     }).sort(function(a, b) { return a.rang - b.rang; });
   }
@@ -585,7 +666,10 @@
     var noData = document.getElementById('duration-no-data');
     var container = document.getElementById('duration-chart-container');
     var statsDiv = document.getElementById('duration-stats');
-    var data = computeDurationAtStep(state.grouped);
+    // grouped est constant après le chargement → calcul mis en cache (était
+    // recalculé à chaque pagination/tri/filtre via renderAll).
+    if (!state.durationAtStep) state.durationAtStep = computeDurationAtStep(state.grouped);
+    var data = state.durationAtStep;
 
     data = data.filter(function(d) { return d.median_days > 0 && d.count >= 2 && d.etape >= 2; });
 
@@ -593,104 +677,325 @@
       canvas.style.display = 'none';
       noData.style.display = 'block';
       if (statsDiv) statsDiv.style.display = 'none';
-      CH.destroy('duration');
+      container.style.display = 'none';
       return;
     }
 
-    canvas.style.display = 'block';
+    // Hide canvas — we use a list instead
+    canvas.style.display = 'none';
     noData.style.display = 'none';
+    var listDiv = document.getElementById('duration-list-container');
 
-    // Find slowest step and total transitions
+    // Find slowest/fastest and total
     var totalTransitions = 0;
     var slowest = data[0];
     var fastest = data[0];
+    var maxMedian = 0;
     for (var k = 0; k < data.length; k++) {
       totalTransitions += data[k].count;
       if (data[k].median_days > slowest.median_days) slowest = data[k];
       if (data[k].median_days < fastest.median_days) fastest = data[k];
+      if (data[k].median_days > maxMedian) maxMedian = data[k].median_days;
     }
 
     // Stats cards
     if (statsDiv) {
-      var slowLabel = slowest.statut && STEP9_SHORT[slowest.statut]
-        ? STEP9_SHORT[slowest.statut]
-        : (C.PHASE_SHORT[slowest.etape] || slowest.phase);
-      var fastLabel = fastest.statut && STEP9_SHORT[fastest.statut]
-        ? STEP9_SHORT[fastest.statut]
-        : (C.PHASE_SHORT[fastest.etape] || fastest.phase);
+      var slowLabel = slowest.explication || C.PHASE_SHORT[slowest.etape] || slowest.phase;
+      var fastLabel = fastest.explication || C.PHASE_SHORT[fastest.etape] || fastest.phase;
       statsDiv.style.display = 'flex';
       statsDiv.innerHTML =
-        '<div class="chart-stat"><span class="chart-stat-value">' + totalTransitions + '</span><span class="chart-stat-label">passages observés</span></div>' +
-        '<div class="chart-stat"><span class="chart-stat-value" style="color:#10b981">' + U.formatDuration(Math.round(fastest.median_days)) + '</span><span class="chart-stat-label">étape la plus rapide<br><small style="color:var(--text-dim)">' + U.escapeHtml(fastLabel) + '</small></span></div>' +
-        '<div class="chart-stat"><span class="chart-stat-value" style="color:#ef4444">' + U.formatDuration(Math.round(slowest.median_days)) + '</span><span class="chart-stat-label">étape la plus lente<br><small style="color:var(--text-dim)">' + U.escapeHtml(slowLabel) + '</small></span></div>';
+        '<div class="chart-stat"><span class="chart-stat-value">' + totalTransitions + '</span><span class="chart-stat-label">passages observ\u00e9s</span></div>' +
+        '<div class="chart-stat"><span class="chart-stat-value" style="color:#10b981">' + U.formatDuration(Math.round(fastest.median_days)) + '</span><span class="chart-stat-label">statut le plus rapide<br><small style="color:var(--text-dim)">' + U.escapeHtml(fastLabel) + '</small></span></div>' +
+        '<div class="chart-stat"><span class="chart-stat-value" style="color:#ef4444">' + U.formatDuration(Math.round(slowest.median_days)) + '</span><span class="chart-stat-label">statut le plus lent<br><small style="color:var(--text-dim)">' + U.escapeHtml(slowLabel) + '</small></span></div>';
     }
 
-    var labels = [];
-    var values = [];
-    var colors = [];
-    var stepData = [];
+    // Build interactive list
+    var html = '<div class="duration-list">';
+    var prevEtape = -1;
 
     for (var i = 0; i < data.length; i++) {
       var d = data[i];
+      var color = C.STEP_COLORS[d.etape] || C.STEP_COLORS[0];
       var sousEtape = C.formatSubStep(d.rang);
-      var shortName = d.statut && STEP9_SHORT[d.statut]
-        ? STEP9_SHORT[d.statut]
-        : (C.PHASE_SHORT[d.etape] || d.phase);
-      labels.push(sousEtape + ' \u2014 ' + shortName);
-      values.push(d.median_days);
-      colors.push(C.STEP_COLORS[d.etape] || C.STEP_COLORS[0]);
-      stepData.push(d);
+      var expl = d.explication || C.PHASE_SHORT[d.etape] || d.phase;
+      var pct = maxMedian > 0 ? Math.min(100, Math.round(d.median_days / maxMedian * 100)) : 0;
+      // Ensure minimum visible bar width
+      var barPct = Math.max(4, pct);
+
+      // Step group separator
+      if (d.etape !== prevEtape) {
+        if (prevEtape !== -1) html += '<div class="duration-list-sep"></div>';
+        prevEtape = d.etape;
+      }
+
+      html += '<div class="duration-list-item" data-idx="' + i + '">' +
+        '<div class="duration-list-left">' +
+          '<span class="duration-list-badge" style="background:' + color + '">' + U.escapeHtml(sousEtape) + '</span>' +
+          '<div class="duration-list-info">' +
+            '<div class="duration-list-name">' + U.escapeHtml(expl) + '</div>' +
+            '<div class="duration-list-code">' + U.escapeHtml(d.statut || '') + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="duration-list-right">' +
+          '<div class="duration-list-bar-wrap">' +
+            '<div class="duration-list-bar" style="width:' + barPct + '%;background:' + color + '"></div>' +
+          '</div>' +
+          '<div class="duration-list-values">' +
+            '<span class="duration-list-median">' + U.formatDuration(Math.round(d.median_days)) + '</span>' +
+            '<span class="duration-list-count">' + d.count + ' dossiers</span>' +
+          '</div>' +
+        '</div>' +
+        '<span class="mouvement-chevron">\u203a</span>' +
+      '</div>';
+    }
+    html += '</div>';
+
+    listDiv.innerHTML = html;
+
+    // Click handlers
+    var items = listDiv.querySelectorAll('.duration-list-item');
+    for (var j = 0; j < items.length; j++) {
+      items[j].addEventListener('click', function(ev) {
+        var idx = parseInt(ev.currentTarget.getAttribute('data-idx'), 10);
+        if (data[idx]) showDurationStepDossiers(data[idx]);
+      });
+    }
+  }
+
+  // ─── Duration Step → Dossier List Modal ────────────────────
+
+  function findSummaryByHash(hash) {
+    return (state.summaryByHash && state.summaryByHash.get(hash)) || null;
+  }
+
+  function showDurationStepDossiers(stepInfo) {
+    var sousEtape = C.formatSubStep(stepInfo.rang);
+    var shortName = stepInfo.explication || C.PHASE_SHORT[stepInfo.etape] || stepInfo.phase;
+    var title = sousEtape + ' \u2014 ' + shortName;
+    var color = C.STEP_COLORS[stepInfo.etape] || '#64748b';
+
+    // Sort dossiers by duration desc
+    var dossiers = stepInfo.dossiers.slice().sort(function(a, b) { return b.days - a.days; });
+
+    // Duration filter ranges
+    var RANGES = [
+      { key: 'all', label: 'Tous', min: 0, max: Infinity },
+      { key: 'lt1', label: '\u2264 1 jour', min: 0, max: 2 },
+      { key: 'lt7', label: '\u2264 1 semaine', min: 0, max: 8 },
+      { key: 'lt14', label: '\u2264 2 semaines', min: 0, max: 15 },
+      { key: 'lt30', label: '\u2264 1 mois', min: 0, max: 31 },
+      { key: 'lt90', label: '\u2264 3 mois', min: 0, max: 91 },
+      { key: 'gt90', label: '> 3 mois', min: 91, max: Infinity }
+    ];
+    // Count per range
+    var rangeCounts = {};
+    for (var r = 0; r < RANGES.length; r++) rangeCounts[RANGES[r].key] = 0;
+    for (var c = 0; c < dossiers.length; c++) {
+      var dd = dossiers[c].days;
+      for (var r2 = 1; r2 < RANGES.length; r2++) {
+        if (dd >= RANGES[r2].min && dd < RANGES[r2].max) rangeCounts[RANGES[r2].key]++;
+      }
+    }
+    rangeCounts.all = dossiers.length;
+    var totalDossiers = dossiers.length;
+
+    // Stats header
+    var statsHtml =
+      '<div class="duration-stats-grid">' +
+        '<div class="duration-stat-card"><span class="duration-stat-value">' + stepInfo.count + '</span><span class="duration-stat-label">passages</span></div>' +
+        '<div class="duration-stat-card"><span class="duration-stat-value" style="color:#3b82f6">' + U.formatDuration(Math.round(stepInfo.median_days)) + '</span><span class="duration-stat-label">m\u00e9diane</span></div>' +
+        '<div class="duration-stat-card"><span class="duration-stat-value" style="color:#10b981">' + (stepInfo.min_days === 0 ? '< 1 jour' : U.formatDuration(stepInfo.min_days)) + '</span><span class="duration-stat-label">min</span></div>' +
+        '<div class="duration-stat-card"><span class="duration-stat-value" style="color:#ef4444">' + U.formatDuration(stepInfo.max_days) + '</span><span class="duration-stat-label">max</span></div>' +
+      '</div>';
+
+    // Filter row: select + result
+    var filterHtml = '<div class="duration-filter-row">' +
+      '<select class="duration-filter-select">';
+    for (var f = 0; f < RANGES.length; f++) {
+      var rng = RANGES[f];
+      var cnt = rangeCounts[rng.key];
+      var pct = totalDossiers ? Math.round(cnt / totalDossiers * 100) : 0;
+      var optLabel = rng.key === 'all'
+        ? rng.label + ' (' + cnt + ')'
+        : rng.label + ' \u2014 ' + cnt + ' (' + pct + '%)';
+      filterHtml += '<option value="' + rng.key + '">' + optLabel + '</option>';
+    }
+    filterHtml += '</select>' +
+      '<span class="duration-filter-result"></span>' +
+    '</div>';
+
+    // Dossier list
+    var listHtml = '';
+    for (var i = 0; i < dossiers.length; i++) {
+      var d = dossiers[i];
+      var summary = findSummaryByHash(d.hash);
+      var dColor = summary ? C.getStepColor(summary.currentStep) : color;
+      var daysColor = d.days >= 60 ? '#ef4444' : d.days >= 30 ? '#f59e0b' : '#10b981';
+
+      listHtml += '<div class="mouvement-dossier-item" data-hash="' + U.escapeHtml(d.hash) + '" data-days="' + d.days + '">' +
+        '<span class="activity-dot" style="background:' + dColor + ';flex-shrink:0"></span>' +
+        '<div class="mouvement-dossier-content">' +
+          '<div class="mouvement-dossier-top">' +
+            '<span class="detail-badge" style="background:' + dColor + ';font-size:0.7rem;padding:0.1rem 0.4rem">' +
+              (summary ? U.escapeHtml(summary.sousEtape) : sousEtape) +
+            '</span>' +
+          '</div>' +
+          '<div class="mouvement-dossier-desc">' +
+            '<span class="duration-dossier-duration" style="color:' + daysColor + '">' + (d.days === 0 ? '< 1 jour' : U.formatDuration(d.days)) + '</span> \u00e0 cette \u00e9tape' +
+          '</div>' +
+          '<div class="mouvement-dossier-detail">' +
+            U.formatDateFr(d.dateFrom) + ' \u2192 ' + U.formatDateFr(d.dateTo) +
+            (summary && summary.prefecture ? ' \u2014 ' + U.escapeHtml(summary.prefecture) : '') +
+          '</div>' +
+        '</div>' +
+        '<span class="mouvement-chevron">\u203a</span>' +
+      '</div>';
     }
 
-    // Dynamic height based on bar count
-    container.style.height = Math.max(250, data.length * 38 + 50) + 'px';
-    container.style.minHeight = 'auto';
+    var modal = document.getElementById('duration-step-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'duration-step-modal';
+      modal.className = 'history-modal-overlay';
+      modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('open');
+      });
+      document.body.appendChild(modal);
+    }
 
-    var config = CH.horizontalBarConfig(labels, values, colors, {
-      suffix: 'j',
-      datalabels: {
-        color: '#e2e8f0',
-        font: { size: 11, weight: 'bold' },
-        anchor: 'end',
-        align: 'right',
-        formatter: function(value, ctx) {
-          return U.formatDuration(Math.round(value)) + ' (' + stepData[ctx.dataIndex].count + ' dossiers)';
-        }
+    modal.innerHTML =
+      '<div class="history-modal">' +
+        '<div class="history-modal-header">' +
+          '<div class="duration-modal-header">' +
+            '<span class="activity-dot" style="background:' + color + ';color:' + color + '"></span>' +
+            '<h3>' + U.escapeHtml(title) + '</h3>' +
+          '</div>' +
+          '<button class="history-close" title="Fermer">\u00d7</button>' +
+        '</div>' +
+        '<div class="modal-history-list mouvement-dossier-list">' +
+          statsHtml +
+          filterHtml +
+          listHtml +
+        '</div>' +
+      '</div>';
+
+    modal.querySelector('.history-close').addEventListener('click', function() {
+      modal.classList.remove('open');
+    });
+
+    // Filter select handler
+    var select = modal.querySelector('.duration-filter-select');
+    var resultEl = modal.querySelector('.duration-filter-result');
+    select.addEventListener('change', function() {
+      var rangeKey = select.value;
+      var range = null;
+      for (var rr = 0; rr < RANGES.length; rr++) {
+        if (RANGES[rr].key === rangeKey) { range = RANGES[rr]; break; }
+      }
+      var allItems = modal.querySelectorAll('.mouvement-dossier-item');
+      var visibleCount = 0;
+      allItems.forEach(function(item) {
+        var days = parseInt(item.getAttribute('data-days'), 10);
+        var show = rangeKey === 'all' || (days >= range.min && days < range.max);
+        item.style.display = show ? '' : 'none';
+        if (show) visibleCount++;
+      });
+      if (rangeKey === 'all') {
+        resultEl.textContent = '';
+      } else {
+        var pct = Math.round(visibleCount / totalDossiers * 100);
+        resultEl.innerHTML = '<span class="duration-filter-result-count">' + visibleCount + '</span>/' + totalDossiers +
+          ' <span class="duration-filter-result-pct">(' + pct + '%)</span>';
       }
     });
 
-    // Register datalabels plugin
-    if (typeof ChartDataLabels !== 'undefined') {
-      config.plugins = [ChartDataLabels];
+    // Click dossier → detail
+    var items = modal.querySelectorAll('.mouvement-dossier-item');
+    for (var j = 0; j < items.length; j++) {
+      items[j].addEventListener('click', function(ev) {
+        var hash = ev.currentTarget.getAttribute('data-hash');
+        modal.classList.remove('open');
+        showDurationDossierDetail(hash, { durationStep: stepInfo });
+      });
     }
 
-    // Enriched tooltip
-    config.options.plugins.tooltip = {
-      callbacks: {
-        title: function(items) { return items[0].label; },
-        label: function(ctx) {
-          var d = stepData[ctx.dataIndex];
-          return 'Attente habituelle : ' + U.formatDuration(Math.round(d.median_days));
-        },
-        afterLabel: function(ctx) {
-          var d = stepData[ctx.dataIndex];
-          var lines = [];
-          lines.push('Le plus rapide : ' + U.formatDuration(d.min_days));
-          lines.push('Le plus long : ' + U.formatDuration(d.max_days));
-          if (d.count >= 4) {
-            lines.push('25% passent en moins de ' + U.formatDuration(d.p25_days));
-            lines.push('75% passent en moins de ' + U.formatDuration(d.p75_days));
-          }
-          lines.push(d.count + ' dossiers observés');
-          return lines;
-        }
+    modal.classList.add('open');
+  }
+
+  // ─── Duration Dossier Detail Modal ─────────────────────────
+
+  function buildDossierInfoHtml(s) {
+    if (!s) return '';
+    var color = C.getStepColor(s.currentStep);
+    var items = [];
+
+    items.push('<span class="detail-badge" style="background:' + color + '">' + U.escapeHtml(s.sousEtape + '/12 \u2014 ' + s.explication) + '</span>');
+
+    if (s.dateDepot) items.push('<div class="detail-row"><span class="detail-label">D\u00e9p\u00f4t</span><span>' + U.formatDateFr(s.dateDepot) + '</span></div>');
+    if (s.dateStatut) {
+      // Étape 11 (IDD) : encore en cours, pas finalisé
+      if (s.isFinished && s.currentStep !== 11) {
+        items.push('<div class="detail-row"><span class="detail-label">Finalis\u00e9 le</span><span>' + U.formatDateFr(s.dateStatut) + '</span></div>');
+      } else {
+        items.push('<div class="detail-row"><span class="detail-label">Statut depuis</span><span>' + U.formatDateFr(s.dateStatut) + (s.daysAtCurrentStatus != null ? ' (' + U.formatDuration(s.daysAtCurrentStatus) + ')' : '') + '</span></div>');
       }
-    };
+    }
+    if (s.daysSinceDeposit != null) items.push('<div class="detail-row"><span class="detail-label">Dur\u00e9e totale</span><span>' + U.formatDuration(s.daysSinceDeposit) + '</span></div>');
+    if (s.dateEntretien) items.push('<div class="detail-row"><span class="detail-label">Entretien</span><span>' + U.formatDateFr(s.dateEntretien) + '</span></div>');
+    if (s.lieuEntretien) items.push('<div class="detail-row"><span class="detail-label">Lieu</span><span>' + U.escapeHtml(s.lieuEntretien) + '</span></div>');
+    if (s.prefecture) items.push('<div class="detail-row"><span class="detail-label">Pr\u00e9fecture</span><span>' + U.escapeHtml(s.prefecture) + '</span></div>');
+    if (s.numeroDecret) items.push('<div class="detail-row"><span class="detail-label">D\u00e9cret</span><span>' + U.escapeHtml(s.numeroDecret) + '</span></div>');
+    if (s.hasComplement) items.push('<div class="detail-row"><span class="detail-label">Compl\u00e9ment</span><span style="color:var(--orange)">Demand\u00e9</span></div>');
+    if (s.lastChecked) items.push('<div class="detail-row"><span class="detail-label">Derni\u00e8re v\u00e9rif.</span><span style="color:var(--text-dim)">' + U.formatDateTimeFr(s.lastChecked) + '</span></div>');
 
-    // Extra right padding for datalabels
-    config.options.layout = { padding: { right: 160 } };
+    return '<div class="dossier-detail-info">' + items.join('') + '</div>';
+  }
 
-    CH.create('duration', 'duration-chart', config);
+  function showDurationDossierDetail(hash, backTo) {
+    var summary = findSummaryByHash(hash);
+    var snaps = summary ? (state.grouped.get(summary.fullHash) || []) : [];
+
+    var infoHtml = buildDossierInfoHtml(summary);
+    var timelineHtml = snaps.length > 0 ? buildStatusTimeline(snaps) : '<div class="detail-section-label" style="color:var(--text-dim)">Aucun historique disponible</div>';
+    var historyLabel = snaps.length > 0 ? '<div class="detail-section-label">Historique des statuts</div>' : '';
+
+    var modal = document.getElementById('duration-dossier-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'duration-dossier-modal';
+      modal.className = 'history-modal-overlay';
+      modal.addEventListener('click', function(e) {
+        if (e.target === modal) modal.classList.remove('open');
+      });
+      document.body.appendChild(modal);
+    }
+
+    modal.innerHTML =
+      '<div class="history-modal">' +
+        '<div class="history-modal-header">' +
+          '<button class="history-back" title="Retour">\u2190</button>' +
+          '<h3>Détails du dossier</h3>' +
+          '<button class="history-close" title="Fermer">\u00d7</button>' +
+        '</div>' +
+        '<div class="modal-history-list">' +
+          infoHtml +
+          historyLabel +
+          timelineHtml +
+        '</div>' +
+      '</div>';
+
+    modal.querySelector('.history-close').addEventListener('click', function() {
+      modal.classList.remove('open');
+    });
+
+    modal.querySelector('.history-back').addEventListener('click', function() {
+      modal.classList.remove('open');
+      if (backTo && backTo.durationStep) {
+        showDurationStepDossiers(backTo.durationStep);
+      }
+    });
+
+    modal.classList.add('open');
   }
 
   // ─── Histogram ───────────────────────────────────────────
@@ -709,6 +1014,14 @@
   }
 
   function renderHistogram(allSummaries) {
+    // L'histogramme ne dépend que de histogramFilters (allSummaries = state.summaries,
+    // constant). On évite de reconstruire le chart Chart.js sur chaque pagination/tri/
+    // filtre dossier qui ne touche pas l'histogramme. Le re-coloriage thème passe par
+    // recolorInstance (charts.js), pas par cette fonction → skip sans risque.
+    var sig = state.histogramFilters.statut + '|' + state.histogramFilters.prefecture;
+    if (state._histogramSig === sig) return;
+    state._histogramSig = sig;
+
     var canvas = document.getElementById('histogram-chart');
     var noData = document.getElementById('histogram-no-data');
     var statsDiv = document.getElementById('histogram-stats');

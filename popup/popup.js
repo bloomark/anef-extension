@@ -9,15 +9,24 @@
 
 import { getStatusExplanation, formatDuration, formatDate, formatDateShort, formatTimestamp, daysSince, isPositiveStatus, isNegativeStatus, formatSubStep, STEP_DEFAULTS } from '../lib/status-parser.js';
 import { downloadLogs } from '../lib/logger.js';
-import { t, translatePage, getLocale } from '../lib/i18n-helper.js';
 // ─────────────────────────────────────────────────────────────
 // Citations sur la patience
 // ─────────────────────────────────────────────────────────────
 
-const QUOTES = Array.from({ length: 12 }, (_, i) => ({
-  text: t(`quote_${i + 1}_text`),
-  author: t(`quote_${i + 1}_author`)
-}));
+const QUOTES = [
+  { text: "La patience est la clé du bien-être.", author: "Mohammed ﷺ" },
+  { text: "Tout vient à point à qui sait attendre.", author: "Proverbe français" },
+  { text: "La patience est amère, mais son fruit est doux.", author: "Jean-Jacques Rousseau" },
+  { text: "Adoptez le rythme de la nature : son secret est la patience.", author: "Ralph Waldo Emerson" },
+  { text: "La patience est l'art d'espérer.", author: "Luc de Clapiers" },
+  { text: "Ce qui est différé n'est pas perdu.", author: "Proverbe italien" },
+  { text: "Les grandes œuvres naissent de la patience.", author: "Gustave Flaubert" },
+  { text: "La patience et le temps font plus que force ni que rage.", author: "Jean de La Fontaine" },
+  { text: "Qui va lentement va sûrement.", author: "Proverbe latin" },
+  { text: "La persévérance vient à bout de tout.", author: "Proverbe français" },
+  { text: "Un voyage de mille lieues commence par un premier pas.", author: "Lao Tseu" },
+  { text: "L'attente est déjà la moitié du bonheur.", author: "Proverbe chinois" }
+];
 
 let quoteInterval = null;
 let currentQuoteIndex = 0;
@@ -97,9 +106,9 @@ function initializeElements() {
     btnLogin: document.getElementById('btn-login'),
     btnCheck: document.getElementById('btn-check'),
     btnRefresh: document.getElementById('btn-refresh'),
-    btnDownload: document.getElementById('btn-download'),
-    btnHistory: document.getElementById('btn-history'),
+    btnShare: document.getElementById('btn-share'),
     btnSettings: document.getElementById('btn-settings'),
+    btnPrivacy: document.getElementById('btn-privacy'),
 
     // Affichage statut
     statusIcon: document.getElementById('status-icon'),
@@ -148,7 +157,6 @@ function initializeElements() {
 
 document.addEventListener('DOMContentLoaded', async () => {
   initializeElements();
-  translatePage();
 
   // Afficher la version
   const manifest = chrome.runtime.getManifest();
@@ -158,7 +166,174 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   attachEventListeners();
+  await renderDossierTabs(); // barre d'onglets multi-dossier
   await loadData();
+  await checkDossierSwitchNotice();
+});
+
+// ─────────────────────────────────────────────────────────────
+// Multi-dossier — barre d'onglets
+// ─────────────────────────────────────────────────────────────
+
+let _activeViewDossierId = null; // null = primaire
+
+async function renderDossierTabs() {
+  const tabs = document.getElementById('dossier-tabs');
+  const scroll = document.getElementById('dossier-tabs-scroll');
+  if (!tabs || !scroll) return;
+
+  try {
+    const { dossiers = {}, primaryDossierId } = await chrome.storage.local.get(['dossiers', 'primaryDossierId']);
+    const ids = Object.keys(dossiers);
+
+    // Moins de 2 dossiers → pas d'onglets (UI simple)
+    if (ids.length < 2) {
+      tabs.classList.add('hidden');
+      _activeViewDossierId = null;
+      return;
+    }
+
+    tabs.classList.remove('hidden');
+
+    // Si aucun onglet actif, on active le primaire
+    if (!_activeViewDossierId || !dossiers[_activeViewDossierId]) {
+      _activeViewDossierId = primaryDossierId || ids[0];
+    }
+
+    // Trier : primaire en premier, puis par lastSeen desc
+    const sorted = ids.slice().sort((a, b) => {
+      if (a === primaryDossierId) return -1;
+      if (b === primaryDossierId) return 1;
+      return (dossiers[b].lastSeen || '').localeCompare(dossiers[a].lastSeen || '');
+    });
+
+    scroll.innerHTML = sorted.map(id => {
+      const d = dossiers[id];
+      const isPrimary = id === primaryDossierId;
+      const isActive = id === _activeViewDossierId;
+      const etape = d.lastStatus?.statut ? getEtapeBadge(d.lastStatus.statut) : '?';
+      const label = dossierLabel(d, id);
+      return `
+        <button class="dossier-tab ${isActive ? 'active' : ''}" data-dossier-id="${escapeAttr(id)}" role="tab" aria-selected="${isActive}">
+          ${isPrimary ? '<span class="dossier-tab-primary-star" title="Dossier principal">★</span>' : ''}
+          <span class="dossier-tab-label">${escapeHtml(label)}</span>
+          <span class="dossier-tab-etape">${escapeHtml(etape)}</span>
+        </button>
+      `;
+    }).join('');
+
+    // Bind clicks
+    scroll.querySelectorAll('.dossier-tab').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        _activeViewDossierId = btn.dataset.dossierId;
+        await renderDossierTabs();
+        await loadData();
+      });
+    });
+  } catch (e) {
+    console.warn('[Popup] renderDossierTabs error:', e);
+    tabs.classList.add('hidden');
+  }
+}
+
+/** Extrait le badge d'étape courte (ex: "8.1", "11") pour affichage onglet */
+function getEtapeBadge(statut) {
+  try {
+    const info = getStatusExplanation(statut);
+    return formatSubStep(info.rang) || String(info.etape);
+  } catch { return '?'; }
+}
+
+/** Label affiché dans l'onglet : numéro national si dispo, sinon ID court.
+ *  Ex : "2024/01234" ou fallback "Dossier ABCDE". */
+function dossierLabel(d, id) {
+  const num = d?.apiData?.numeroNational;
+  if (num) return String(num);
+  // Fallback : 5 premiers chars de l'ID (hash) si pas encore de numéro national
+  return 'Dossier ' + String(id || '').substring(0, 5);
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+// Re-render quand le storage change (nouveau dossier observé, primaire changé)
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.dossiers || changes.primaryDossierId) {
+    renderDossierTabs().catch(() => {});
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Bannière "changement de dossier détecté"
+// ─────────────────────────────────────────────────────────────
+
+async function checkDossierSwitchNotice() {
+  try {
+    const { dossierSwitchNotice } = await chrome.storage.local.get('dossierSwitchNotice');
+    if (!dossierSwitchNotice || dossierSwitchNotice.acknowledged) return;
+    showDossierSwitchBanner();
+  } catch (e) {
+    console.warn('[Popup] Erreur lecture dossierSwitchNotice:', e);
+  }
+}
+
+function showDossierSwitchBanner() {
+  const banner = document.getElementById('dossier-switch-banner');
+  if (!banner) return;
+  banner.classList.remove('hidden');
+
+  document.getElementById('btn-dossier-switch-dismiss')?.addEventListener('click', async () => {
+    await dismissDossierSwitchNotice();
+    banner.classList.add('hidden');
+  });
+
+  document.getElementById('btn-dossier-switch-analyze')?.addEventListener('click', async () => {
+    // Bascule l'onglet popup sur le dossier nouvellement détecté (ses données
+    // sont déjà fraîches côté storage — pas besoin de relancer un refresh).
+    try {
+      const { dossierSwitchNotice } = await chrome.storage.local.get('dossierSwitchNotice');
+      if (dossierSwitchNotice?.newId) {
+        _activeViewDossierId = dossierSwitchNotice.newId;
+        await renderDossierTabs();
+        await loadData();
+      }
+    } catch (e) {
+      console.warn('[Popup] Erreur bascule nouveau dossier:', e);
+    }
+    await dismissDossierSwitchNotice();
+    banner.classList.add('hidden');
+  });
+}
+
+async function dismissDossierSwitchNotice() {
+  try {
+    const { dossierSwitchNotice } = await chrome.storage.local.get('dossierSwitchNotice');
+    if (dossierSwitchNotice) {
+      await chrome.storage.local.set({
+        dossierSwitchNotice: { ...dossierSwitchNotice, acknowledged: true }
+      });
+    }
+  } catch (e) {
+    console.warn('[Popup] Erreur dismiss notice:', e);
+  }
+}
+
+// Écoute en temps réel : si l'utilisateur est dans la popup quand un
+// changement de dossier est détecté par le service-worker, afficher
+// immédiatement la bannière.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.dossierSwitchNotice) return;
+  const notice = changes.dossierSwitchNotice.newValue;
+  if (notice && !notice.acknowledged) {
+    showDossierSwitchBanner();
+    // Recharger les données pour refléter le nouveau dossier
+    loadData().catch(() => {});
+  }
 });
 
 /** Attache les gestionnaires d'événements */
@@ -168,9 +343,24 @@ function attachEventListeners() {
   elements.btnCheck?.addEventListener('click', () => openAnefPage('mon-compte'));
   document.getElementById('btn-renew-password')?.addEventListener('click', () => openAnefPage('login'));
   elements.btnRefresh?.addEventListener('click', refreshInBackground);
-  elements.btnDownload?.addEventListener('click', downloadStatusImage);
-  elements.btnHistory?.addEventListener('click', () => chrome.runtime.openOptionsPage());
+  elements.btnShare?.addEventListener('click', shareStatusText);
   elements.btnSettings?.addEventListener('click', () => chrome.runtime.openOptionsPage());
+
+  // Privacy toggle
+  elements.btnPrivacy?.addEventListener('click', () => {
+    const isNowPrivate = document.body.classList.toggle('privacy-mode');
+    document.getElementById('icon-eye-open').style.display = isNowPrivate ? 'none' : '';
+    document.getElementById('icon-eye-closed').style.display = isNowPrivate ? '' : 'none';
+    chrome.storage.local.set({ privacyMode: isNowPrivate });
+  });
+  // Restore privacy state
+  chrome.storage.local.get('privacyMode', (d) => {
+    if (d.privacyMode) {
+      document.body.classList.add('privacy-mode');
+      document.getElementById('icon-eye-open').style.display = 'none';
+      document.getElementById('icon-eye-closed').style.display = '';
+    }
+  });
 
   // Clic sur la version = export logs (caché pour les devs)
   document.getElementById('version')?.addEventListener('click', handleExportLogs);
@@ -187,6 +377,106 @@ function attachEventListeners() {
     e.preventDefault();
     chrome.runtime.openOptionsPage();
   });
+
+  // Multi-dossier : actions secondaires
+  document.getElementById('btn-make-primary')?.addEventListener('click', handleMakePrimary);
+  document.getElementById('btn-remove-dossier')?.addEventListener('click', handleRemoveDossier);
+}
+
+async function handleMakePrimary() {
+  if (!_activeViewDossierId) return;
+  const ok = confirm(
+    'Définir ce dossier comme principal ?\n\n' +
+    "L'auto-check utilisera les identifiants enregistrés pour ce dossier " +
+    '(ou aucun si tu n\'en as pas encore saisi — gère-les dans Paramètres).'
+  );
+  if (!ok) return;
+
+  const response = await chrome.runtime.sendMessage({
+    type: 'SET_PRIMARY_DOSSIER',
+    dossierId: _activeViewDossierId
+  });
+  if (response?.success) {
+    _activeViewDossierId = null; // reset → pointe vers nouveau primaire
+    await renderDossierTabs();
+    await loadData();
+  } else {
+    alert('Erreur : ' + (response?.error || 'impossible de changer le principal'));
+  }
+}
+
+function showRefreshErrorBanner(title, message) {
+  const banner = document.getElementById('refresh-error-banner');
+  if (!banner) return;
+  const titleEl = document.getElementById('refresh-error-title');
+  const msgEl = document.getElementById('refresh-error-message');
+  if (titleEl) titleEl.textContent = title;
+  if (msgEl) msgEl.textContent = message;
+  banner.classList.remove('hidden');
+
+  const openBtn = document.getElementById('btn-refresh-error-open-anef');
+  const dismissBtn = document.getElementById('btn-refresh-error-dismiss');
+  if (openBtn && !openBtn.dataset.bound) {
+    openBtn.dataset.bound = '1';
+    openBtn.addEventListener('click', () => {
+      chrome.runtime.sendMessage({ type: 'OPEN_ANEF', page: 'mon-compte' });
+      window.close();
+    });
+  }
+  if (dismissBtn && !dismissBtn.dataset.bound) {
+    dismissBtn.dataset.bound = '1';
+    dismissBtn.addEventListener('click', () => banner.classList.add('hidden'));
+  }
+}
+
+function showWrongAccountBanner(info) {
+  const banner = document.getElementById('wrong-account-banner');
+  if (!banner) return;
+  const expectedEl = document.getElementById('wrong-account-expected');
+  const fetchedEl = document.getElementById('wrong-account-fetched');
+  if (expectedEl) expectedEl.textContent = info.expectedNumero || ('Dossier ' + (info.expectedId || '').substring(0, 5));
+  if (fetchedEl) fetchedEl.textContent = info.fetchedNumero || ('Dossier ' + (info.fetchedId || '').substring(0, 5));
+  banner.classList.remove('hidden');
+
+  // Bind actions (idempotent)
+  const logoutBtn = document.getElementById('btn-wrong-account-logout');
+  const dismissBtn = document.getElementById('btn-wrong-account-dismiss');
+  if (logoutBtn && !logoutBtn.dataset.bound) {
+    logoutBtn.dataset.bound = '1';
+    logoutBtn.addEventListener('click', () => {
+      // Ouvre ANEF dans un nouvel onglet actif → user peut se déconnecter
+      chrome.runtime.sendMessage({ type: 'OPEN_ANEF', page: 'mon-compte' });
+      window.close();
+    });
+  }
+  if (dismissBtn && !dismissBtn.dataset.bound) {
+    dismissBtn.dataset.bound = '1';
+    dismissBtn.addEventListener('click', () => {
+      banner.classList.add('hidden');
+    });
+  }
+}
+
+async function handleRemoveDossier() {
+  if (!_activeViewDossierId) return;
+  const ok = confirm(
+    'Retirer ce dossier de ta liste locale ?\n\n' +
+    'Les données anonymes côté serveur ne sont pas supprimées — seule ta liste locale est nettoyée. ' +
+    'Tu pourras le retrouver en te reconnectant à ce dossier sur ANEF.'
+  );
+  if (!ok) return;
+
+  const response = await chrome.runtime.sendMessage({
+    type: 'REMOVE_DOSSIER',
+    dossierId: _activeViewDossierId
+  });
+  if (response?.success) {
+    _activeViewDossierId = null;
+    await renderDossierTabs();
+    await loadData();
+  } else {
+    alert('Erreur : ' + (response?.error || 'impossible de retirer'));
+  }
 }
 
 /** Copie le code statut dans le presse-papier */
@@ -230,7 +520,7 @@ async function handleExportLogs() {
 // Chargement des données
 // ─────────────────────────────────────────────────────────────
 
-/** Charge les données depuis le service worker */
+/** Charge les données depuis le service worker (ou depuis dossiers[id] si onglet secondaire actif) */
 async function loadData() {
   try {
     const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
@@ -250,7 +540,22 @@ async function loadData() {
       return;
     }
 
-    const { lastStatus, lastCheck, lastCheckAttempt, apiData } = response;
+    // Si on a un onglet secondaire actif, on bypasse GET_STATUS et on lit
+    // directement le record dans chrome.storage.local.dossiers[id]
+    let { lastStatus, lastCheck, lastCheckAttempt, apiData } = response;
+    const { dossiers = {}, primaryDossierId } = await chrome.storage.local.get(['dossiers', 'primaryDossierId']);
+    const isViewingSecondary = _activeViewDossierId && _activeViewDossierId !== primaryDossierId;
+
+    if (isViewingSecondary && dossiers[_activeViewDossierId]) {
+      const d = dossiers[_activeViewDossierId];
+      lastStatus = d.lastStatus;
+      apiData = d.apiData;
+      lastCheck = d.lastCheck;
+      lastCheckAttempt = null; // pas de tentative pour un secondaire
+    }
+
+    // Toggle UI : boutons actualiser (primaire) vs actions secondaires
+    toggleSecondaryActionsUI(isViewingSecondary);
 
     if (!lastStatus) {
       showView('noData');
@@ -261,6 +566,23 @@ async function loadData() {
     displayLastCheck(lastCheck, lastCheckAttempt);
     showView('status');
 
+    // Avertissement si primaire sans creds (et qu'on est en train de voir le primaire)
+    const noCredsBanner = document.getElementById('no-creds-banner');
+    if (noCredsBanner) {
+      const showBanner = response.primaryHasCredentials === false && !isViewingSecondary;
+      noCredsBanner.classList.toggle('hidden', !showBanner);
+      if (showBanner) {
+        const btn = document.getElementById('btn-no-creds-open-settings');
+        if (btn && !btn.dataset.bound) {
+          btn.dataset.bound = '1';
+          btn.addEventListener('click', () => {
+            chrome.runtime.openOptionsPage();
+            window.close();
+          });
+        }
+      }
+    }
+
   } catch (error) {
     console.error('[Popup] Erreur chargement:', error);
     showView('noData');
@@ -269,6 +591,14 @@ async function loadData() {
     loadAutoCheckNext();
     checkStepDatesAlert();
   }
+}
+
+/** Bascule l'UI entre mode primaire et mode secondaire */
+function toggleSecondaryActionsUI(isSecondary) {
+  const refreshBtn = document.getElementById('btn-refresh');
+  const secondaryActions = document.getElementById('secondary-actions');
+  if (refreshBtn) refreshBtn.style.display = isSecondary ? 'none' : '';
+  if (secondaryActions) secondaryActions.classList.toggle('hidden', !isSecondary);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -292,7 +622,7 @@ function displayStatus(statusData, apiData, lastCheck) {
   // Icône et phase
   if (elements.statusIcon) elements.statusIcon.textContent = statusInfo.icon || '📋';
   if (elements.statusPhase) elements.statusPhase.textContent = statusInfo.phase;
-  if (elements.statusStep) elements.statusStep.textContent = t('popup_step_format', [formatSubStep(statusInfo.rang)]);
+  if (elements.statusStep) elements.statusStep.textContent = `Étape ${formatSubStep(statusInfo.rang)}/12`;
 
   // Code et description
   if (elements.statusCode) elements.statusCode.textContent = statut;
@@ -320,7 +650,7 @@ function displayStatus(statusData, apiData, lastCheck) {
       if (earliestDate) {
         const days = daysSince(earliestDate);
         const duration = formatDuration(days);
-        elements.statusDate.textContent = `${formatDate(earliestDate)} (${days === 0 ? t('time_today') : t('time_ago', [duration])})`;
+        elements.statusDate.textContent = `${formatDate(earliestDate)} (${days === 0 ? "aujourd'hui" : 'il y a ' + duration})`;
       } else {
         elements.statusDate.textContent = '—';
       }
@@ -328,16 +658,24 @@ function displayStatus(statusData, apiData, lastCheck) {
       // Dernière MAJ (date ANEF la plus récente, peut être = date statut ou plus récente)
       const statusLastCheck = document.getElementById('status-last-check');
       if (statusLastCheck) {
-        if (date_statut && earliestDate && date_statut.substring(0, 10) !== earliestDate.substring(0, 10)) {
-          // La date ANEF est différente (plus récente) → afficher comme dernière MAJ
-          statusLastCheck.textContent = formatDate(date_statut, true);
-        } else if (lastCheck) {
-          statusLastCheck.textContent = formatDate(lastCheck, true);
+        const majDate = (date_statut && earliestDate && date_statut.substring(0, 10) !== earliestDate.substring(0, 10))
+          ? date_statut : lastCheck;
+        if (majDate) {
+          const datePart = formatDate(majDate);
+          const d = new Date(majDate);
+          const timePart = !isNaN(d) ? d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' }) : '';
+          statusLastCheck.textContent = datePart + ' ';
+          if (timePart) {
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'privacy-time';
+            timeSpan.textContent = timePart;
+            statusLastCheck.appendChild(timeSpan);
+          }
         } else {
           statusLastCheck.textContent = '—';
         }
       }
-    })();
+    })().catch(e => console.warn('[Popup] Erreur mise à jour dates:', e));
   }
 
   // Barre de progression
@@ -384,11 +722,11 @@ function displayTemporalStats(statusData, apiData) {
     if (isPast) {
       const days = daysSince(dateEntretien);
       elements.statEntretienValue.textContent = days === 0
-        ? t('interview_today')
-        : t('interview_ago', [formatDuration(days)]);
+        ? "Aujourd'hui"
+        : `Il y a ${formatDuration(days)}`;
     } else {
       const days = Math.ceil((entretienDateObj - now) / 86400000);
-      elements.statEntretienValue.textContent = t('time_in', [formatDuration(days)]);
+      elements.statEntretienValue.textContent = `Dans ${formatDuration(days)}`;
     }
     elements.statEntretienDate.textContent = formatDate(dateEntretien, true);
     elements.statEntretien.classList.remove('hidden');
@@ -478,12 +816,15 @@ function displayLastCheck(lastCheck, lastCheckAttempt) {
   elements.lastCheckDate.textContent = '';
 
   if (lastCheck) {
-    // Si la dernière tentative est plus récente et en échec, afficher les deux
-    if (lastCheckAttempt && !lastCheckAttempt.success && lastCheckAttempt.timestamp > lastCheck) {
+    // Si la dernière tentative a échoué ET est strictement plus récente, afficher les deux
+    const attemptFailed = lastCheckAttempt && !lastCheckAttempt.success;
+    const attemptNewer = attemptFailed && lastCheckAttempt.timestamp &&
+      new Date(lastCheckAttempt.timestamp).getTime() > new Date(lastCheck).getTime() + 5000;
+    if (attemptNewer) {
       elements.lastCheckDate.textContent = formatDateShort(lastCheck) + ' ';
       const span = document.createElement('span');
       span.className = 'last-check-attempt';
-      span.textContent = '(' + t('popup_attempt', [formatDateShort(lastCheckAttempt.timestamp)]) + ')';
+      span.textContent = '(tentative ' + formatDateShort(lastCheckAttempt.timestamp) + ')';
       elements.lastCheckDate.appendChild(span);
     } else {
       elements.lastCheckDate.textContent = formatDateShort(lastCheck);
@@ -491,10 +832,10 @@ function displayLastCheck(lastCheck, lastCheckAttempt) {
   } else if (lastCheckAttempt) {
     const span = document.createElement('span');
     span.className = 'last-check-attempt';
-    span.textContent = t('popup_attempt_prefix', [formatDateShort(lastCheckAttempt.timestamp)]);
+    span.textContent = 'Tentative ' + formatDateShort(lastCheckAttempt.timestamp);
     elements.lastCheckDate.appendChild(span);
   } else {
-    elements.lastCheckDate.textContent = t('popup_never');
+    elements.lastCheckDate.textContent = 'Jamais';
   }
 }
 
@@ -519,25 +860,25 @@ async function loadAutoCheckNext() {
 
     if (info.passwordExpired) {
       container.classList.add('warning');
-      text.textContent = t('popup_password_expired_banner');
+      text.textContent = 'Mot de passe ANEF expiré · renouveler sur le portail';
     } else if (!info.hasCredentials) {
       container.classList.add('warning');
-      text.textContent = t('popup_autocheck_creds_required');
+      text.textContent = 'Vérification auto activée · identifiants requis';
     } else if (info.nextAlarm) {
       const diffMin = Math.round((info.nextAlarm - Date.now()) / 60000);
       let delai;
       if (diffMin <= 0) {
-        delai = t('popup_autocheck_imminent');
+        delai = 'imminente';
       } else if (diffMin < 60) {
-        delai = t('popup_autocheck_minutes', [diffMin.toString()]);
+        delai = `dans ~${diffMin} min`;
       } else {
         const hours = Math.floor(diffMin / 60);
         const mins = diffMin % 60;
-        delai = t('popup_autocheck_hours', [hours.toString(), mins > 0 ? mins.toString().padStart(2, '0') : '']);
+        delai = `dans ~${hours}h${mins > 0 ? mins.toString().padStart(2, '0') : ''}`;
       }
-      text.textContent = t('popup_autocheck_next', [delai]);
+      text.textContent = `Vérification auto activée · prochaine ${delai}`;
     } else {
-      text.textContent = t('popup_autocheck_enabled');
+      text.textContent = 'Vérification auto activée';
     }
   } catch (e) {
     console.warn('[Popup] Erreur chargement auto-check info:', e);
@@ -567,24 +908,24 @@ function updateLoadingStep(step) {
   switch (step) {
     case 1:
       stepOpen?.classList.add('active');
-      if (loadingMessage) loadingMessage.textContent = t('popup_loading_step1');
+      if (loadingMessage) loadingMessage.textContent = 'Ouverture de la page ANEF...';
       break;
     case 2:
       stepOpen?.classList.add('done');
       stepLoad?.classList.add('active');
-      if (loadingMessage) loadingMessage.textContent = t('popup_loading_step2');
+      if (loadingMessage) loadingMessage.textContent = 'Chargement de la page...';
       break;
     case 3:
       stepOpen?.classList.add('done');
       stepLoad?.classList.add('done');
       stepData?.classList.add('active');
-      if (loadingMessage) loadingMessage.textContent = t('popup_loading_step3');
+      if (loadingMessage) loadingMessage.textContent = 'Récupération des données...';
       break;
     case 4:
       stepOpen?.classList.add('done');
       stepLoad?.classList.add('done');
       stepData?.classList.add('done');
-      if (loadingMessage) loadingMessage.textContent = t('popup_loading_step4');
+      if (loadingMessage) loadingMessage.textContent = 'Terminé !';
       break;
   }
 }
@@ -614,10 +955,23 @@ async function refreshInBackground() {
 
   try {
     const result = await chrome.runtime.sendMessage({ type: 'BACKGROUND_REFRESH' });
-    clearInterval(progressInterval);
 
     if (result?.needsLogin) {
-      showView('notConnected');
+      // Session ANEF expirée + pas d'identifiants → on revient au status
+      // mais on affiche la bannière d'erreur explicite (et la bannière no-creds)
+      await loadData();
+      showRefreshErrorBanner(
+        'Non connecté à ANEF',
+        'Ta session ANEF a expiré et aucun identifiant n\'est enregistré. Connecte-toi manuellement sur ANEF ou configure tes identifiants.'
+      );
+      return;
+    }
+
+    // v2.6.1 : priorité au cas "mauvais compte" avant maintenance —
+    // si on a reçu des données pour un autre dossier, c'est PAS une maintenance
+    if (result?.unexpectedDossier) {
+      showWrongAccountBanner(result.unexpectedDossier);
+      await loadData();
       return;
     }
 
@@ -626,18 +980,31 @@ async function refreshInBackground() {
       return;
     }
 
+    if (result?.passwordExpired) {
+      showView('passwordExpired');
+      return;
+    }
+
     if (result?.success) {
       updateLoadingStep(4);
       await new Promise(r => setTimeout(r, 500));
+    } else if (!result?.aborted) {
+      // Échec générique (timeout, login échoué, erreur réseau…) → message explicite
+      await loadData();
+      showRefreshErrorBanner(
+        'Actualisation impossible',
+        result?.error || 'Impossible de récupérer les données. Vérifie ta connexion et tes identifiants.'
+      );
+      return;
     }
 
     await loadData();
 
   } catch (error) {
-    clearInterval(progressInterval);
     console.error('[Popup] Erreur refresh:', error);
     await loadData();
   } finally {
+    clearInterval(progressInterval);
     stopQuoteCarousel();
     if (elements.btnRefresh) {
       elements.btnRefresh.classList.remove('loading');
@@ -651,7 +1018,7 @@ async function refreshInBackground() {
 // ─────────────────────────────────────────────────────────────
 
 /** Génère et télécharge une image du suivi */
-async function downloadStatusImage() {
+async function shareStatusText() {
   try {
     const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
     if (!response?.lastStatus) return;
@@ -659,254 +1026,114 @@ async function downloadStatusImage() {
     const { lastStatus, apiData } = response;
     const statusInfo = getStatusExplanation(lastStatus.statut);
 
-    // Canvas
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    const width = 520;
-    const height = 340;
-    canvas.width = width;
-    canvas.height = height;
+    // Récupérer les stepDates pour les dates rectifiées
+    const sdData = await chrome.storage.local.get('stepDates');
+    const stepDates = sdData.stepDates || [];
 
-    // Couleurs
-    const bleuFrance = '#002654';
-    const rouge = '#ce1126';
-    const blanc = '#ffffff';
+    // Construire les lignes du texte (anonyme, pas d'info perso)
+    const lines = [];
+    lines.push(`Mon dossier ANEF — ${statusInfo.phase}`);
+    lines.push(`Étape ${formatSubStep(statusInfo.rang)}/12`);
+    lines.push('');
 
-    // Fond
-    const bgGradient = ctx.createLinearGradient(0, 0, 0, height);
-    bgGradient.addColorStop(0, '#f8fafc');
-    bgGradient.addColorStop(1, '#e9ecef');
-    ctx.fillStyle = bgGradient;
-    ctx.fillRect(0, 0, width, height);
-
-    // Header bleu
-    ctx.fillStyle = bleuFrance;
-    ctx.fillRect(0, 0, width, 52);
-
-    // Bande tricolore
-    ctx.fillStyle = bleuFrance;
-    ctx.fillRect(0, 52, width / 3, 3);
-    ctx.fillStyle = blanc;
-    ctx.fillRect(width / 3, 52, width / 3, 3);
-    ctx.fillStyle = rouge;
-    ctx.fillRect(2 * width / 3, 52, width / 3, 3);
-
-    // Titre
-    ctx.fillStyle = blanc;
-    ctx.font = 'bold 17px system-ui, -apple-system, sans-serif';
-    ctx.fillText('ANEF Status Tracker', 20, 24);
-
-    // Date et heure
-    const now = new Date();
-    const dateStr = formatDate(now);
-    const timeStr = now.toLocaleTimeString(getLocale(), { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
-    ctx.font = '11px system-ui, -apple-system, sans-serif';
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
-    ctx.fillText(`${dateStr} ${t('canvas_date_at')} ${timeStr}`, 20, 42);
-
-    // Carte principale
-    const cardY = 68;
-    const cardHeight = 115;
-
-    // Ombre
-    ctx.fillStyle = 'rgba(0, 38, 84, 0.1)';
-    roundRect(ctx, 22, cardY + 4, width - 44, cardHeight, 12);
-    ctx.fill();
-
-    // Fond carte
-    ctx.fillStyle = blanc;
-    roundRect(ctx, 20, cardY, width - 40, cardHeight, 12);
-    ctx.fill();
-
-    // Bordure gauche
-    const borderGradient = ctx.createLinearGradient(20, cardY, 20, cardY + cardHeight);
-    borderGradient.addColorStop(0, bleuFrance);
-    borderGradient.addColorStop(1, rouge);
-    ctx.fillStyle = borderGradient;
-    ctx.fillRect(20, cardY + 8, 4, cardHeight - 16);
-
-    // Phase
-    ctx.fillStyle = '#1e293b';
-    ctx.font = 'bold 16px system-ui, -apple-system, sans-serif';
-    ctx.fillText(statusInfo.phase, 36, cardY + 26);
-
-    // Badge étape
-    ctx.fillStyle = '#e8f0fe';
-    roundRect(ctx, 36, cardY + 34, 70, 20, 10);
-    ctx.fill();
-    ctx.fillStyle = bleuFrance;
-    ctx.font = '11px system-ui, -apple-system, sans-serif';
-    ctx.fillText(t('popup_step_format', [formatSubStep(statusInfo.rang)]), 46, cardY + 48);
-
-    // Badge code statut
-    ctx.font = '11px Monaco, Consolas, monospace';
-    const codeWidth = ctx.measureText(lastStatus.statut).width + 20;
-    ctx.fillStyle = '#fef3c7';
-    roundRect(ctx, 115, cardY + 34, codeWidth, 20, 10);
-    ctx.fill();
-    ctx.fillStyle = '#92400e';
-    ctx.fillText(lastStatus.statut, 125, cardY + 48);
-
-    // Barre de progression
-    const progressY = cardY + 70;
-    const progressWidth = width - 80;
-    const progressHeight = 10;
-
-    ctx.fillStyle = '#e2e8f0';
-    roundRect(ctx, 36, progressY, progressWidth, progressHeight, 5);
-    ctx.fill();
-    ctx.strokeStyle = '#cbd5e1';
-    ctx.lineWidth = 1;
-    roundRect(ctx, 36, progressY, progressWidth, progressHeight, 5);
-    ctx.stroke();
-
-    const progress = (statusInfo.etape / 12) * progressWidth;
-    if (progress > 0) {
-      const progressGradient = ctx.createLinearGradient(36, 0, 36 + progressWidth, 0);
-      progressGradient.addColorStop(0, bleuFrance);
-      progressGradient.addColorStop(0.6, '#3b5998');
-      progressGradient.addColorStop(1, rouge);
-      ctx.fillStyle = progressGradient;
-      roundRect(ctx, 36, progressY, progress, progressHeight, 5);
-      ctx.fill();
+    // Statut actuel avec date
+    const manualEntry = stepDates.find(sd =>
+      (sd.statut || '').toLowerCase() === (lastStatus.statut || '').toLowerCase()
+    );
+    const statutDate = manualEntry?.date_statut || lastStatus.date_statut;
+    if (statutDate) {
+      const days = daysSince(statutDate);
+      const duration = days !== null ? (days === 0 ? " (aujourd'hui)" : ` (il y a ${formatDuration(days)})`) : '';
+      lines.push(`Statut : ${lastStatus.statut}`);
+      lines.push(`${statusInfo.description}`);
+      lines.push(`Depuis le : ${formatDate(statutDate)}${duration}`);
+    } else {
+      lines.push(`Statut : ${lastStatus.statut}`);
+      lines.push(`${statusInfo.description}`);
     }
 
-    // Labels progression
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '9px system-ui, -apple-system, sans-serif';
-    ctx.fillText(t('popup_progress_start'), 36, progressY + 20);
-    ctx.textAlign = 'right';
-    ctx.fillText(t('popup_progress_end'), 36 + progressWidth, progressY + 20);
-    ctx.textAlign = 'left';
+    // Historique des étapes traversées (stepDates + history + apiData)
+    const histData = await chrome.storage.local.get('history');
+    const history = histData.history || [];
 
-    // Section stats
-    const statsY = 200;
-    const statWidth = 150;
-    const statGap = 12;
-
-    let statsCount = 0;
-    if (apiData?.dateDepot) statsCount++;
-    if (apiData?.dateEntretien) statsCount++;
-    if (lastStatus.date_statut) statsCount++;
-
-    let statIndex = 0;
-    const totalStatsWidth = statsCount * statWidth + (statsCount - 1) * statGap;
-    const startX = (width - totalStatsWidth) / 2;
-
-    if (apiData?.dateDepot) {
-      drawStatCard(ctx, startX + statIndex * (statWidth + statGap), statsY, statWidth, t('canvas_depot'), formatDuration(daysSince(apiData.dateDepot)), bleuFrance);
-      statIndex++;
+    // Fusionner toutes les sources de dates par statut
+    const dateByStatut = {};
+    for (const h of history) {
+      const key = (h.statut || '').toLowerCase();
+      if (key && h.date_statut) dateByStatut[key] = h.date_statut;
+    }
+    for (const sd of stepDates) {
+      const key = (sd.statut || '').toLowerCase();
+      if (key && sd.date_statut) dateByStatut[key] = sd.date_statut; // stepDates prioritaires
     }
 
-    if (apiData?.dateEntretien) {
-      const entretienDate = new Date(apiData.dateEntretien);
-      const isPast = entretienDate < new Date();
-      const label = isPast ? t('canvas_entretien') : t('canvas_entretien_planned');
-      const dateFormatted = formatDate(apiData.dateEntretien, true);
-      const entretienDays = daysSince(apiData.dateEntretien);
-      const duration = isPast
-        ? (entretienDays === 0 ? t('interview_today') : t('interview_ago', [formatDuration(entretienDays)]))
-        : t('time_in', [formatDuration(Math.ceil((entretienDate - new Date()) / 86400000))]);
-      drawStatCard(ctx, startX + statIndex * (statWidth + statGap), statsY, statWidth, label, `${dateFormatted} (${duration})`, bleuFrance);
-      statIndex++;
+    // Construire la timeline avec durée passée à chaque étape
+    const stepsWithDates = [];
+    for (const step of STEP_DEFAULTS) {
+      const key = step.statut.toLowerCase();
+      let date = dateByStatut[key];
+      if (!date && step.etape === 2 && apiData?.dateDepot) date = apiData.dateDepot;
+      if (!date && step.etape === 7 && apiData?.dateEntretien) date = apiData.dateEntretien;
+      if (date) stepsWithDates.push({ ...step, date });
     }
 
-    if (lastStatus.date_statut) {
-      drawStatCard(ctx, startX + statIndex * (statWidth + statGap), statsY, statWidth, t('canvas_last_update'), formatDuration(daysSince(lastStatus.date_statut)), bleuFrance);
+    const timeline = [];
+    for (let i = 0; i < stepsWithDates.length; i++) {
+      const s = stepsWithDates[i];
+      const indent = s.sub ? '  ' : '';
+      const prefix = s.sub || s.etape;
+      const isLast = i === stepsWithDates.length - 1;
+
+      if (isLast) {
+        // Étape en cours : "il y a X" ou "aujourd'hui"
+        const days = daysSince(s.date);
+        const agoStr = days === 0 ? " (aujourd'hui)" : days > 0 ? ` (il y a ${formatDuration(days)})` : '';
+        timeline.push(`${s.icon} ${indent}${prefix}. ${s.label} — ${formatDate(s.date)}${agoStr} \u2190 en cours`);
+      } else {
+        // Étape passée : durée passée à ce statut
+        const nextDate = stepsWithDates[i + 1].date;
+        const daysAt = Math.round((new Date(nextDate) - new Date(s.date)) / 86400000);
+        const spentStr = daysAt > 0 ? ` (${formatDuration(daysAt)} à ce statut)` : daysAt === 0 ? ' (< 1 jour à ce statut)' : '';
+        timeline.push(`${s.icon} ${indent}${prefix}. ${s.label} — ${formatDate(s.date)}${spentStr}`);
+      }
     }
 
-    // Footer tricolore
-    const footerY = height - 25;
-    ctx.fillStyle = bleuFrance;
-    ctx.fillRect(width/2 - 60, footerY, 40, 2);
-    ctx.fillStyle = '#e2e8f0';
-    ctx.fillRect(width/2 - 20, footerY, 40, 2);
-    ctx.fillStyle = rouge;
-    ctx.fillRect(width/2 + 20, footerY, 40, 2);
+    if (timeline.length) {
+      lines.push('');
+      lines.push('Parcours :');
+      lines.push(...timeline);
+    }
 
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '9px system-ui, -apple-system, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('ANEF Status Tracker', width / 2, height - 8);
-    ctx.textAlign = 'left';
+    // Barre de progression texte
+    const step = statusInfo.etape;
+    const filled = Math.round((step / 12) * 10);
+    const bar = '▓'.repeat(filled) + '░'.repeat(10 - filled);
+    lines.push('');
+    lines.push(`Progression : [${bar}] ${step}/12`);
 
-    // Téléchargement
-    const link = document.createElement('a');
-    link.download = `anef-suivi-${now.toISOString().slice(0,10)}_${timeStr.replace(':', 'h')}.png`;
-    link.href = canvas.toDataURL('image/png');
-    link.click();
+    lines.push('');
+    lines.push('— ANEF Status Tracker');
+
+    const text = lines.join('\n');
+
+    // Copier dans le clipboard
+    await navigator.clipboard.writeText(text);
+
+    // Feedback visuel sur le bouton
+    const btn = elements.btnShare;
+    const btnLabel = btn?.querySelector('span');
+    if (btn && btnLabel) {
+      const originalText = btnLabel.textContent;
+      btnLabel.textContent = 'Copié !';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btnLabel.textContent = originalText;
+        btn.classList.remove('copied');
+      }, 2000);
+    }
 
   } catch (error) {
-    console.error('[Popup] Erreur génération image:', error);
-  }
-}
-
-/** Dessine un rectangle arrondi */
-function roundRect(ctx, x, y, width, height, radius) {
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.lineTo(x + width - radius, y);
-  ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
-  ctx.lineTo(x + width, y + height - radius);
-  ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
-  ctx.lineTo(x + radius, y + height);
-  ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
-  ctx.lineTo(x, y + radius);
-  ctx.quadraticCurveTo(x, y, x + radius, y);
-  ctx.closePath();
-}
-
-/** Dessine une carte de statistique */
-function drawStatCard(ctx, x, y, width, label, value, accentColor) {
-  const cardHeight = 80;
-
-  // Ombre
-  ctx.fillStyle = 'rgba(0, 38, 84, 0.08)';
-  roundRect(ctx, x + 2, y + 3, width, cardHeight, 10);
-  ctx.fill();
-
-  // Fond
-  ctx.fillStyle = '#ffffff';
-  roundRect(ctx, x, y, width, cardHeight, 10);
-  ctx.fill();
-
-  // Bordure gauche
-  const borderGrad = ctx.createLinearGradient(x, y, x, y + cardHeight);
-  borderGrad.addColorStop(0, accentColor);
-  borderGrad.addColorStop(1, '#ce1126');
-  ctx.fillStyle = borderGrad;
-  ctx.fillRect(x, y + 8, 3, cardHeight - 16);
-
-  // Label
-  ctx.fillStyle = '#64748b';
-  ctx.font = '9px system-ui, -apple-system, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.fillText(label, x + 12, y + 18);
-
-  // Valeur (avec retour à la ligne si nécessaire)
-  ctx.fillStyle = '#1e293b';
-  ctx.font = 'bold 11px system-ui, -apple-system, sans-serif';
-
-  const words = value.split(' ');
-  let line = '';
-  let lineY = y + 34;
-  const maxLines = 3;
-  let lineCount = 0;
-
-  for (const word of words) {
-    const testLine = line + word + ' ';
-    if (ctx.measureText(testLine).width > width - 20 && line !== '') {
-      ctx.fillText(line.trim(), x + 12, lineY);
-      line = word + ' ';
-      lineY += 14;
-      lineCount++;
-      if (lineCount >= maxLines) break;
-    } else {
-      line = testLine;
-    }
-  }
-  if (lineCount < maxLines) {
-    ctx.fillText(line.trim(), x + 12, lineY);
+    console.error('[Popup] Erreur partage texte:', error);
   }
 }
 
@@ -938,8 +1165,10 @@ async function checkStepDatesAlert() {
     if (response.apiData.dateDepot) coveredStatuts.add('dossier_depose');
     if (response.apiData.dateEntretien) coveredStatuts.add('ea_en_attente_ea');
 
-    // Étapes passées ou en cours (rang <= currentRang)
+    // Seuls les jalons obligatoires (locked) sans date déclenchent l'alerte.
+    // Les étapes intermédiaires non observées sont simplement sautées.
     const pastSteps = STEP_DEFAULTS.filter(s => {
+      if (!s.locked) return false;
       const sRang = getStatusExplanation(s.statut).rang;
       return sRang <= currentRang;
     });

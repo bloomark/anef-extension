@@ -11,78 +11,88 @@
 
 import * as storage from '../lib/storage.js';
 import { getStatusExplanation, formatDate, formatDateShort, formatDuration, daysSince, formatSubStep, STEP_DEFAULTS } from '../lib/status-parser.js';
-import { t, translatePage, getLocale } from '../lib/i18n-helper.js';
 
 // ─────────────────────────────────────────────────────────────
-// Éléments DOM
+// Éléments DOM (initialisés dans DOMContentLoaded)
 // ─────────────────────────────────────────────────────────────
 
-const tabs = document.querySelectorAll('.tab');
-const tabContents = document.querySelectorAll('.tab-content');
+let tabs, tabContents;
+const elements = {};
 
-const elements = {
-  // Historique
-  historyList: document.getElementById('history-list'),
+// ─────────────────────────────────────────────────────────────
+// État multi-dossier (v2.6.0+) — dossier sélectionné dans le dropdown
+// ─────────────────────────────────────────────────────────────
+let _selectedDossierId = null;        // null = primaire
+let _isViewingSecondary = false;      // true si on consulte un secondaire
 
-  // Step dates
-  stepDatesSection: document.getElementById('step-dates-section'),
-  stepDatesTimeline: document.getElementById('step-dates-timeline'),
-  btnSaveDates: document.getElementById('btn-save-dates'),
-  btnPullDates: document.getElementById('btn-pull-dates'),
+function initializeElements() {
+  tabs = document.querySelectorAll('.tab');
+  tabContents = document.querySelectorAll('.tab-content');
 
-  // Paramètres
-  settingNotifications: document.getElementById('setting-notifications'),
-  settingHistoryLimit: document.getElementById('setting-history-limit'),
-  btnSaveSettings: document.getElementById('btn-save-settings'),
-  btnResetSettings: document.getElementById('btn-reset-settings'),
+  Object.assign(elements, {
+    // Historique
+    historyList: document.getElementById('history-list'),
 
-  // Identifiants
-  settingUsername: document.getElementById('setting-username'),
-  settingPassword: document.getElementById('setting-password'),
-  btnTogglePassword: document.getElementById('btn-toggle-password'),
-  iconEye: document.getElementById('icon-eye'),
-  iconEyeOff: document.getElementById('icon-eye-off'),
-  credentialIndicator: document.getElementById('credential-indicator'),
-  credentialStatusText: document.getElementById('credential-status-text'),
-  btnSaveCredentials: document.getElementById('btn-save-credentials'),
-  btnClearCredentials: document.getElementById('btn-clear-credentials'),
+    // Step dates
+    stepDatesSection: document.getElementById('step-dates-section'),
+    stepDatesTimeline: document.getElementById('step-dates-timeline'),
+    btnSaveDates: document.getElementById('btn-save-dates'),
+    btnPullDates: document.getElementById('btn-pull-dates'),
 
-  // Export/Import
-  btnExport: document.getElementById('btn-export'),
-  btnImport: document.getElementById('btn-import'),
-  importFile: document.getElementById('import-file'),
-  btnClearAll: document.getElementById('btn-clear-all'),
+    // Paramètres
+    settingNotifications: document.getElementById('setting-notifications'),
+    settingHistoryLimit: document.getElementById('setting-history-limit'),
+    btnSaveSettings: document.getElementById('btn-save-settings'),
+    btnResetSettings: document.getElementById('btn-reset-settings'),
 
-  // Auto-check
-  settingAutoCheck: document.getElementById('setting-auto-check'),
-  autoCheckToggleWrapper: document.getElementById('auto-check-toggle-wrapper'),
-  autoCheckStatus: document.getElementById('auto-check-status'),
-  autoCheckDot: document.getElementById('auto-check-dot'),
-  autoCheckStatusText: document.getElementById('auto-check-status-text'),
-  autoCheckNoCreds: document.getElementById('auto-check-no-creds'),
-  autoCheckSuspended: document.getElementById('auto-check-suspended'),
-  btnResumeAutoCheck: document.getElementById('btn-resume-auto-check'),
-  checkLogSection: document.getElementById('check-log-section'),
-  checkLogList: document.getElementById('check-log-list'),
+    // Identifiants
+    settingUsername: document.getElementById('setting-username'),
+    settingPassword: document.getElementById('setting-password'),
+    btnTogglePassword: document.getElementById('btn-toggle-password'),
+    iconEye: document.getElementById('icon-eye'),
+    iconEyeOff: document.getElementById('icon-eye-off'),
+    credentialIndicator: document.getElementById('credential-indicator'),
+    credentialStatusText: document.getElementById('credential-status-text'),
+    btnSaveCredentials: document.getElementById('btn-save-credentials'),
+    btnClearCredentials: document.getElementById('btn-clear-credentials'),
 
-  // Debug
-  logsContainer: document.getElementById('logs-container'),
-  btnRefreshLogs: document.getElementById('btn-refresh-logs'),
-  btnClearLogs: document.getElementById('btn-clear-logs'),
+    // Export/Import
+    btnExport: document.getElementById('btn-export'),
+    btnImport: document.getElementById('btn-import'),
+    importFile: document.getElementById('import-file'),
+    btnClearAll: document.getElementById('btn-clear-all'),
 
-  // Toast
-  toast: document.getElementById('toast')
-};
+    // Auto-check
+    settingAutoCheck: document.getElementById('setting-auto-check'),
+    autoCheckToggleWrapper: document.getElementById('auto-check-toggle-wrapper'),
+    autoCheckStatus: document.getElementById('auto-check-status'),
+    autoCheckDot: document.getElementById('auto-check-dot'),
+    autoCheckStatusText: document.getElementById('auto-check-status-text'),
+    autoCheckNoCreds: document.getElementById('auto-check-no-creds'),
+    autoCheckSuspended: document.getElementById('auto-check-suspended'),
+    btnResumeAutoCheck: document.getElementById('btn-resume-auto-check'),
+    checkLogSection: document.getElementById('check-log-section'),
+    checkLogList: document.getElementById('check-log-list'),
+
+    // Debug
+    logsContainer: document.getElementById('logs-container'),
+    btnRefreshLogs: document.getElementById('btn-refresh-logs'),
+    btnClearLogs: document.getElementById('btn-clear-logs'),
+
+    // Toast
+    toast: document.getElementById('toast')
+  });
+}
 
 // ─────────────────────────────────────────────────────────────
 // Initialisation
 // ─────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
-  translatePage();
-  document.title = t('options_page_title');
+  initializeElements();
   initTabs();
   initVersion();
+  await initDossierSelector(); // multi-dossier v2.6.0
 
   await loadHistory();
   await loadStepDates();
@@ -153,16 +163,116 @@ function attachEventListeners() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Sélecteur multi-dossier (v2.6.0+)
+// ─────────────────────────────────────────────────────────────
+
+async function initDossierSelector() {
+  const wrap = document.getElementById('dossier-selector-wrap');
+  const pills = document.getElementById('dossier-pills');
+  if (!wrap || !pills) return;
+
+  const dossiers = await storage.getDossiers();
+  const primaryId = await storage.getPrimaryDossierId();
+  const ids = Object.keys(dossiers);
+
+  // Moins de 2 dossiers → pas besoin de la barre
+  if (ids.length < 2) {
+    wrap.classList.add('hidden');
+    _selectedDossierId = null;
+    _isViewingSecondary = false;
+    return;
+  }
+
+  wrap.classList.remove('hidden');
+
+  // Par défaut : primaire
+  if (!_selectedDossierId || !dossiers[_selectedDossierId]) {
+    _selectedDossierId = primaryId;
+  }
+
+  // Construire les pills (primaire en tête)
+  const sorted = ids.slice().sort((a, b) => {
+    if (a === primaryId) return -1;
+    if (b === primaryId) return 1;
+    return (dossiers[b].lastSeen || '').localeCompare(dossiers[a].lastSeen || '');
+  });
+
+  pills.innerHTML = sorted.map(id => {
+    const d = dossiers[id];
+    const isPrimary = id === primaryId;
+    const isActive = id === _selectedDossierId;
+    // Numéro national en priorité, fallback hash 5 chars
+    const num = d?.apiData?.numeroNational
+      ? String(d.apiData.numeroNational)
+      : 'N° ' + id.substring(0, 5);
+    const etape = d.lastStatus?.statut ? getStatusExplanation(d.lastStatus.statut).etape : '?';
+    const role = isPrimary ? 'Principal' : 'Secondaire';
+    const classes = ['dossier-pill', isActive ? 'active' : '', isPrimary ? 'primary' : 'secondary'].filter(Boolean).join(' ');
+    return `
+      <button class="${classes}" data-dossier-id="${escapeAttr(id)}" role="tab" aria-selected="${isActive}">
+        ${isPrimary ? '<span class="dossier-pill-star" title="Dossier principal">★</span>' : ''}
+        <span class="dossier-pill-num">${escapeHtml(num)}</span>
+        <span class="dossier-pill-etape" title="Étape ANEF">${escapeHtml(String(etape))}</span>
+        <span class="dossier-pill-role">${role}</span>
+      </button>
+    `;
+  }).join('');
+
+  // Bind clicks
+  pills.querySelectorAll('.dossier-pill').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      _selectedDossierId = btn.dataset.dossierId;
+      // Re-render pour mettre à jour l'état active
+      await initDossierSelector();
+      await applyDossierSelection();
+    });
+  });
+}
+
+/** Recharge toutes les sections en fonction du dossier sélectionné */
+async function applyDossierSelection() {
+  const primaryId = await storage.getPrimaryDossierId();
+  _isViewingSecondary = _selectedDossierId && _selectedDossierId !== primaryId;
+
+  // Bannière lecture seule
+  const banner = document.getElementById('secondary-readonly-banner');
+  if (banner) banner.classList.toggle('hidden', !_isViewingSecondary);
+
+  // Cacher complètement les boutons d'édition sur un secondaire
+  // (plus propre que juste disabled — pas de confusion possible)
+  const editButtons = [
+    elements.btnSaveDates, elements.btnPullDates
+  ].filter(Boolean);
+  for (const btn of editButtons) {
+    btn.style.display = _isViewingSecondary ? 'none' : '';
+    btn.disabled = _isViewingSecondary; // ceinture + bretelles
+  }
+
+  // Recharger toutes les sections avec le nouveau scope
+  await loadHistory();
+  await loadStepDates();
+  await loadCredentialStatus(); // credentials sont scopées au dossier
+}
+
+function escapeAttr(s) { return escapeHtml(s); }
+
+/** Retourne le dossierId actuel pour les reads (null = primaire par défaut) */
+function currentDossierId() {
+  return _selectedDossierId || null;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Historique
 // ─────────────────────────────────────────────────────────────
 
 async function loadHistory() {
-  let history = await storage.getHistory();
-  const lastCheck = await storage.getLastCheck();
+  const did = currentDossierId();
+  let history = await storage.getHistory(did);
+  const lastCheck = await storage.getLastCheck(did);
 
   // Dédupliquer : une seule entrée par statut
   // stepDates (rectifications) ont priorité sur l'historique
-  const stepDatesForHistory = await storage.getStepDates();
+  const stepDatesForHistory = await storage.getStepDates(did);
   const sdMap = {};
   for (const sd of stepDatesForHistory) {
     sdMap[(sd.statut || '').toLowerCase()] = (sd.date_statut || '').substring(0, 10);
@@ -184,7 +294,16 @@ async function loadHistory() {
   }
   const deduped = Object.values(byStatut);
   if (deduped.length < history.length || stepDatesForHistory.length) {
-    await storage.set({ history: deduped });
+    // N'écrire la déduplication QUE pour le dossier primaire. Pour un secondaire,
+    // on affiche la version dédupliquée en mémoire mais on ne mute pas le storage
+    // (lecture seule UX + évite d'écraser la history legacy du primaire).
+    if (!_isViewingSecondary) {
+      if (did) {
+        await storage.upsertDossier(did, { history: deduped });
+      } else {
+        await storage.set({ history: deduped });
+      }
+    }
     history = deduped;
   }
 
@@ -194,7 +313,7 @@ async function loadHistory() {
     lastCheckHtml = `
       <div class="last-check-banner">
         <span class="last-check-icon">🔄</span>
-        <span>${t('options_last_check_banner')}<strong>${formatDate(lastCheck, true)}</strong></span>
+        <span>Dernière vérification : <strong>${formatDate(lastCheck, true)}</strong></span>
       </div>
     `;
   }
@@ -204,8 +323,8 @@ async function loadHistory() {
       ${lastCheckHtml}
       <div class="empty-state">
         <span class="empty-icon">📊</span>
-        <p>${t('options_no_history')}</p>
-        <p class="empty-hint">${t('options_no_history_hint')}</p>
+        <p>Aucun historique disponible</p>
+        <p class="empty-hint">Visitez le site ANEF pour enregistrer votre historique.</p>
       </div>
     `;
     return;
@@ -226,13 +345,13 @@ async function loadHistory() {
           <div class="history-phase">${info.phase}</div>
           <code class="history-code">${item.statut}</code>
           <div class="history-date">
-            ${item.date_statut ? `${t('options_since', [statusDate])} <span class="duration-badge">${duration}</span>` : t('options_date_unknown')}
+            ${item.date_statut ? `Depuis le ${statusDate} <span class="duration-badge">${duration}</span>` : 'Date inconnue'}
           </div>
         </div>
         <div class="history-step">
-          <span class="step-label">${t('options_step_label')}</span>
+          <span class="step-label">étape</span>
           <span class="step-number">${formatSubStep(info.rang)}</span>
-          <span class="step-total">${t('options_step_total')}</span>
+          <span class="step-total">sur 12</span>
         </div>
       </div>
     `;
@@ -244,7 +363,8 @@ async function loadHistory() {
 // ─────────────────────────────────────────────────────────────
 
 async function loadStepDates() {
-  const apiData = await storage.getApiData();
+  const did = currentDossierId();
+  const apiData = await storage.getApiData(did);
   if (!apiData?.dossierId) {
     elements.stepDatesSection?.classList.add('hidden');
     return;
@@ -252,17 +372,24 @@ async function loadStepDates() {
 
   elements.stepDatesSection?.classList.remove('hidden');
 
-  const history = await storage.getHistory();
-  const stepDates = await storage.getStepDates();
-  const lastStatus = await storage.getLastStatus();
+  const history = await storage.getHistory(did);
+  const stepDates = await storage.getStepDates(did);
+  const lastStatus = await storage.getLastStatus(did);
   const currentInfo = lastStatus ? getStatusExplanation(lastStatus.statut) : null;
   const currentEtape = currentInfo ? currentInfo.etape : 0;
   const currentRang = currentInfo ? currentInfo.rang : 0;
 
-  // Dates auto (sources fiables uniquement : apiData + statut actuel)
+  // Dates auto : apiData + statut actuel + historique observé
   const autoByStatut = {};
   if (apiData.dateDepot) autoByStatut['dossier_depose'] = toDateStr(apiData.dateDepot);
   if (apiData.dateEntretien) autoByStatut['ea_en_attente_ea'] = toDateStr(apiData.dateEntretien);
+  // Remplir depuis l'historique (statuts passés observés par l'extension)
+  for (const h of history) {
+    const key = (h.statut || '').toLowerCase();
+    const date = toDateStr(h.date_statut);
+    if (key && date) autoByStatut[key] = date;
+  }
+  // Le statut actuel a priorité (date la plus récente)
   if (lastStatus?.date_statut) {
     autoByStatut[lastStatus.statut.toLowerCase()] = toDateStr(lastStatus.date_statut);
   }
@@ -289,21 +416,22 @@ async function loadStepDates() {
     const stepRang = getStatusExplanation(step.statut).rang;
     const isFuture = !isCurrent && stepRang > currentRang;
     const itemClass = (isCurrent ? 'current ' : '') + (isFuture ? 'future ' : '') + (isAuto ? 'auto' : (dateValue ? 'filled' : ''));
-    const etapeLabel = step.sub ? t('options_step_sub', [step.sub]) : t('options_step_sub', [step.etape.toString()]);
-    const disabled = (isAuto || isLocked || isFuture) ? 'disabled' : '';
+    const etapeLabel = step.sub ? `Étape ${step.sub}` : `Étape ${step.etape}`;
+    // En mode lecture seule (dossier secondaire), tout est désactivé
+    const disabled = (isAuto || isLocked || isFuture || _isViewingSecondary) ? 'disabled' : '';
 
     let badgeHtml = '';
     if (hasManualOverride) {
-      badgeHtml = `<span class="step-date-badge manual">${t('options_badge_rectified')}</span>`;
+      badgeHtml = '<span class="step-date-badge manual">Rectifié</span>';
     } else if (isAuto) {
-      badgeHtml = `<span class="step-date-badge auto">${t('options_badge_auto')}</span>`;
+      badgeHtml = '<span class="step-date-badge auto">Auto</span>';
     } else if (dateValue) {
-      badgeHtml = `<span class="step-date-badge manual">${t('options_badge_manual')}</span>`;
+      badgeHtml = '<span class="step-date-badge manual">Manuel</span>';
     }
 
-    // Bouton modifier pour les auto non verrouillés et non futurs
+    // Bouton modifier : masqué en mode lecture seule
     let editBtn = '';
-    if (disabled && !isLocked && !isFuture) {
+    if (disabled && !isLocked && !isFuture && !_isViewingSecondary) {
       editBtn = '<button class="step-date-edit-btn" title="Rectifier la date">✏️</button>';
     }
 
@@ -403,15 +531,15 @@ async function loadStepDates() {
     if (autoVal && curVal && curVal !== autoVal) {
       item.classList.remove('auto');
       item.classList.add('filled');
-      if (badge) { badge.textContent = t('options_badge_rectified'); badge.className = 'step-date-badge manual'; }
+      if (badge) { badge.textContent = 'Rectifié'; badge.className = 'step-date-badge manual'; }
     } else if (autoVal && (!curVal || curVal === autoVal)) {
       item.classList.remove('filled');
       item.classList.add('auto');
-      if (badge) { badge.textContent = t('options_badge_auto'); badge.className = 'step-date-badge auto'; }
+      if (badge) { badge.textContent = 'Auto'; badge.className = 'step-date-badge auto'; }
     } else if (curVal) {
       item.classList.add('filled');
       if (!badge) {
-        input.closest('.step-date-field').insertAdjacentHTML('afterend', `<span class="step-date-badge manual">${t('options_badge_manual')}</span>`);
+        input.closest('.step-date-field').insertAdjacentHTML('afterend', '<span class="step-date-badge manual">Manuel</span>');
       }
     }
     markUnsaved();
@@ -425,7 +553,7 @@ function markUnsaved() {
     banner = document.createElement('div');
     banner.id = 'unsaved-banner';
     banner.className = 'unsaved-banner';
-    banner.innerHTML = `<span class="unsaved-dot"></span> ${t('options_unsaved')}`;
+    banner.innerHTML = '<span class="unsaved-dot"></span> Modifications non enregistrées';
     elements.stepDatesTimeline.parentElement.insertBefore(banner, elements.stepDatesTimeline);
   }
   banner.classList.add('show');
@@ -447,7 +575,7 @@ async function handleSaveStepDates() {
     const val = input.dataset.value;
     if (val) {
       if (prevDate && val < prevDate) {
-        showToast(t('options_dates_chronological'), 'error');
+        showToast('Les dates doivent être chronologiques', 'error');
         input.focus();
         return;
       }
@@ -480,8 +608,8 @@ async function handleSaveStepDates() {
     } else if (!isoVal && existing) {
       // Champ vidé mais date existante → garder l'ancienne (pas de suppression)
       entries.push(existing);
-      showToast(t('options_date_cannot_delete'), 'error');
-      return;
+      showToast('Une date déjà enregistrée ne peut pas être supprimée', 'error');
+      continue;
     }
   }
 
@@ -502,13 +630,13 @@ async function handleSaveStepDates() {
   await loadStepDates();
   await loadHistory();
   clearUnsaved();
-  showToast(t('options_dates_saved'), 'success');
+  showToast('Dates enregistrées et synchronisées', 'success');
 }
 
 async function handlePullStepDates() {
   try {
     elements.btnPullDates.disabled = true;
-    elements.btnPullDates.textContent = t('options_loading');
+    elements.btnPullDates.textContent = 'Chargement...';
 
     const result = await chrome.runtime.sendMessage({ type: 'PULL_STEP_DATES' });
 
@@ -520,12 +648,12 @@ async function handlePullStepDates() {
     if (result?.count > 0) {
       await loadStepDates();
       await loadHistory();
-      showToast(t('options_dates_pulled', [result.count.toString()]), 'success');
+      showToast(`${result.count} date(s) récupérée(s) depuis la base`, 'success');
     } else {
-      showToast(t('options_no_data_found'), 'info');
+      showToast('Aucune donnée trouvée dans la base', 'info');
     }
   } catch (e) {
-    showToast(t('options_connection_error'), 'error');
+    showToast('Erreur de connexion', 'error');
   } finally {
     elements.btnPullDates.disabled = false;
     elements.btnPullDates.innerHTML = `
@@ -534,7 +662,7 @@ async function handlePullStepDates() {
         <polyline points="7 10 12 15 17 10"></polyline>
         <line x1="12" y1="15" x2="12" y2="3"></line>
       </svg>
-      ${t('options_pull_dates')}`;
+      Récupérer`;
   }
 }
 
@@ -544,8 +672,8 @@ async function handlePullStepDates() {
 
 async function loadSettings() {
   const settings = await storage.getSettings();
-  elements.settingNotifications.checked = settings.notificationsEnabled;
-  elements.settingHistoryLimit.value = settings.historyLimit.toString();
+  if (elements.settingNotifications) elements.settingNotifications.checked = settings.notificationsEnabled;
+  if (elements.settingHistoryLimit) elements.settingHistoryLimit.value = settings.historyLimit.toString();
   if (elements.settingAutoCheck) {
     elements.settingAutoCheck.checked = settings.autoCheckEnabled;
   }
@@ -555,9 +683,9 @@ async function handleSaveSettings() {
   const autoCheckEnabled = elements.settingAutoCheck?.checked || false;
 
   await storage.saveSettings({
-    notificationsEnabled: elements.settingNotifications.checked,
+    notificationsEnabled: elements.settingNotifications?.checked ?? true,
     autoCheckEnabled,
-    historyLimit: parseInt(elements.settingHistoryLimit.value, 10)
+    historyLimit: parseInt(elements.settingHistoryLimit?.value || '100', 10)
   });
 
   // Notifier le service worker pour reconfigurer l'alarme
@@ -568,11 +696,11 @@ async function handleSaveSettings() {
   }
 
   await loadAutoCheckStatus();
-  showToast(t('options_settings_saved'), 'success');
+  showToast('Paramètres sauvegardés', 'success');
 }
 
 async function handleResetSettings() {
-  if (!confirm(t('options_confirm_reset'))) return;
+  if (!confirm('Réinitialiser les paramètres par défaut ?')) return;
 
   // Préserver le jitter unique de cette installation
   const currentSettings = await storage.getSettings();
@@ -588,7 +716,7 @@ async function handleResetSettings() {
   } catch (e) { /* ignore */ }
   await loadAutoCheckStatus();
 
-  showToast(t('options_settings_reset'), 'success');
+  showToast('Paramètres réinitialisés', 'success');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -596,14 +724,27 @@ async function handleResetSettings() {
 // ─────────────────────────────────────────────────────────────
 
 async function loadCredentialStatus() {
-  const hasCredentials = await storage.hasCredentials();
+  const did = currentDossierId();
+  const hasCredentials = await storage.hasCredentials(did);
+
+  // Afficher le label avec le numéro du dossier courant
+  const label = await _dossierLabelForCreds(did);
+  const labelEl = document.getElementById('credentials-dossier-label');
+  const pillEl = document.getElementById('credentials-dossier-pill');
+  if (labelEl) labelEl.textContent = label;
+
+  // Afficher le pill uniquement si >= 2 dossiers (sinon le contexte est implicite)
+  if (pillEl) {
+    const dossiers = await storage.getDossiers();
+    pillEl.classList.toggle('hidden', Object.keys(dossiers).length < 2);
+  }
 
   if (hasCredentials) {
     elements.credentialIndicator?.classList.add('active');
     if (elements.credentialStatusText) {
-      elements.credentialStatusText.textContent = t('options_credentials_saved');
+      elements.credentialStatusText.textContent = 'Identifiants enregistrés pour ' + label;
     }
-    const creds = await storage.getCredentials();
+    const creds = await storage.getCredentials(did);
     if (creds?.username && elements.settingUsername) {
       elements.settingUsername.value = creds.username;
       elements.settingPassword.value = '••••••••';
@@ -612,9 +753,23 @@ async function loadCredentialStatus() {
   } else {
     elements.credentialIndicator?.classList.remove('active');
     if (elements.credentialStatusText) {
-      elements.credentialStatusText.textContent = t('options_no_credentials_saved');
+      elements.credentialStatusText.textContent = 'Aucun identifiant pour ' + label;
+    }
+    // Vider les champs pour le dossier courant
+    if (elements.settingUsername) elements.settingUsername.value = '';
+    if (elements.settingPassword) {
+      elements.settingPassword.value = '';
+      elements.settingPassword.dataset.hasPassword = 'false';
     }
   }
+}
+
+/** Label lisible du dossier pour l'UI credentials */
+async function _dossierLabelForCreds(did) {
+  const d = await storage.getDossier(did) || await storage.getPrimaryDossier();
+  if (!d) return 'ce dossier';
+  const num = d.apiData?.numeroNational;
+  return num ? String(num) : ('Dossier ' + (d.apiData?.dossierId || '').substring(0, 5));
 }
 
 async function togglePasswordVisibility() {
@@ -624,7 +779,7 @@ async function togglePasswordVisibility() {
   if (passwordInput.type === 'password') {
     // Charger le vrai mot de passe si placeholder affiché
     if (passwordInput.value === '••••••••' && passwordInput.dataset.hasPassword === 'true') {
-      const creds = await storage.getCredentials();
+      const creds = await storage.getCredentials(currentDossierId());
       if (creds?.password) {
         passwordInput.value = creds.password;
       }
@@ -640,22 +795,23 @@ async function togglePasswordVisibility() {
 }
 
 async function handleSaveCredentials() {
+  const did = currentDossierId();
   const username = elements.settingUsername?.value?.trim();
   let password = elements.settingPassword?.value;
 
   // Garder le mot de passe existant si placeholder
   if (password === '••••••••' && elements.settingPassword?.dataset.hasPassword === 'true') {
-    const existingCreds = await storage.getCredentials();
+    const existingCreds = await storage.getCredentials(did);
     password = existingCreds?.password;
   }
 
   if (!username || !password) {
-    showToast(t('options_fill_all_fields'), 'error');
+    showToast('Veuillez remplir tous les champs', 'error');
     return;
   }
 
   try {
-    await storage.saveCredentials(username, password);
+    await storage.saveCredentials(username, password, did);
     elements.settingPassword.dataset.hasPassword = 'true';
     await loadCredentialStatus();
 
@@ -665,17 +821,20 @@ async function handleSaveCredentials() {
     } catch (e) { /* ignore */ }
     await loadAutoCheckStatus();
 
-    showToast(t('options_credentials_saved'), 'success');
+    const label = await _dossierLabelForCreds(did);
+    showToast('Identifiants enregistrés pour ' + label, 'success');
   } catch (error) {
-    showToast(t('options_save_error'), 'error');
+    showToast('Erreur lors de la sauvegarde', 'error');
   }
 }
 
 async function handleClearCredentials() {
-  if (!confirm(t('options_confirm_delete_creds'))) return;
+  const did = currentDossierId();
+  const label = await _dossierLabelForCreds(did);
+  if (!confirm('Supprimer les identifiants de ' + label + ' ?')) return;
 
   try {
-    await storage.clearCredentials();
+    await storage.clearCredentials(did);
     if (elements.settingUsername) elements.settingUsername.value = '';
     if (elements.settingPassword) {
       elements.settingPassword.value = '';
@@ -694,9 +853,9 @@ async function handleClearCredentials() {
       await loadAutoCheckStatus();
     }
 
-    showToast(t('options_credentials_deleted'), 'success');
+    showToast('Identifiants supprimés', 'success');
   } catch (error) {
-    showToast(t('options_delete_error'), 'error');
+    showToast('Erreur lors de la suppression', 'error');
   }
 }
 
@@ -724,7 +883,7 @@ async function loadAutoCheckStatus() {
       if (passwordExpired) {
         elements.autoCheckSuspended.classList.remove('hidden');
         const suspendedText = elements.autoCheckSuspended.querySelector('.auto-check-suspended-text, span');
-        if (suspendedText) suspendedText.textContent = t('options_password_expired_msg');
+        if (suspendedText) suspendedText.textContent = 'Mot de passe ANEF expiré — renouveler sur le portail';
       } else {
         elements.autoCheckSuspended.classList.add('hidden');
       }
@@ -739,12 +898,12 @@ async function loadAutoCheckStatus() {
 
         if (passwordExpired) {
           elements.autoCheckDot.className = 'auto-check-dot error';
-          elements.autoCheckStatusText.textContent = t('options_password_expired_short');
+          elements.autoCheckStatusText.textContent = 'Mot de passe expiré';
         } else if (consecutiveFailures > 0 && nextAlarm) {
           elements.autoCheckDot.className = 'auto-check-dot warning';
           const nextDate = new Date(nextAlarm);
           const diffMin = Math.round((nextDate - Date.now()) / 60000);
-          elements.autoCheckStatusText.textContent = t('options_failures_next', [consecutiveFailures.toString(), diffMin.toString()]);
+          elements.autoCheckStatusText.textContent = `${consecutiveFailures} échec(s) · prochaine tentative dans ~${diffMin} min`;
         } else if (nextAlarm) {
           elements.autoCheckDot.className = 'auto-check-dot active';
           const nextDate = new Date(nextAlarm);
@@ -752,17 +911,17 @@ async function loadAutoCheckStatus() {
           const diffMin = Math.round((nextDate - now) / 60000);
 
           if (diffMin <= 0) {
-            elements.autoCheckStatusText.textContent = t('options_next_check_imminent');
+            elements.autoCheckStatusText.textContent = 'Prochaine vérification imminente';
           } else if (diffMin < 60) {
-            elements.autoCheckStatusText.textContent = t('options_next_check_min', [diffMin.toString()]);
+            elements.autoCheckStatusText.textContent = `Prochaine vérification dans ~${diffMin} min`;
           } else {
             const hours = Math.floor(diffMin / 60);
             const mins = diffMin % 60;
-            elements.autoCheckStatusText.textContent = t('options_next_check_hours', [hours.toString(), mins > 0 ? mins.toString().padStart(2, '0') : '']);
+            elements.autoCheckStatusText.textContent = `Prochaine vérification dans ~${hours}h${mins > 0 ? mins.toString().padStart(2, '0') : ''}`;
           }
         } else {
           elements.autoCheckDot.className = 'auto-check-dot';
-          elements.autoCheckStatusText.textContent = t('options_waiting_schedule');
+          elements.autoCheckStatusText.textContent = 'En attente de programmation';
         }
       }
     }
@@ -782,9 +941,9 @@ async function handleResumeAutoCheck() {
     }
     await chrome.runtime.sendMessage({ type: 'SETTINGS_CHANGED' });
     await loadAutoCheckStatus();
-    showToast(t('options_autocheck_reactivated'), 'success');
+    showToast('Vérification automatique réactivée', 'success');
   } catch (e) {
-    showToast(t('options_reactivation_error'), 'error');
+    showToast('Erreur lors de la réactivation', 'error');
   }
 }
 
@@ -808,13 +967,13 @@ async function loadCheckLog() {
 
     elements.checkLogSection?.classList.remove('hidden');
 
-    const typeLabels = { auto: t('options_badge_auto'), manual: t('options_badge_manual'), retry: 'Retry' };
+    const typeLabels = { auto: 'Auto', manual: 'Manuel', retry: 'Retry' };
     const typeClasses = { auto: 'badge-auto', manual: 'badge-manual', retry: 'badge-retry' };
 
     elements.checkLogList.innerHTML = todayEntries
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
       .map(entry => {
-        const time = new Date(entry.timestamp).toLocaleTimeString(getLocale(), { hour: '2-digit', minute: '2-digit' });
+        const time = new Date(entry.timestamp).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
         const badge = `<span class="check-log-badge ${typeClasses[entry.type] || ''}">${typeLabels[entry.type] || entry.type}</span>`;
         const icon = entry.success ? '<span class="check-log-icon success">✓</span>' : '<span class="check-log-icon error">✗</span>';
         const duration = entry.duration != null ? `<span class="check-log-duration">${entry.duration}s</span>` : '';
@@ -840,12 +999,14 @@ async function handleExport() {
     const a = document.createElement('a');
     a.href = url;
     a.download = `anef-status-backup-${new Date().toISOString().split('T')[0]}.json`;
+    document.body.appendChild(a);
     a.click();
+    a.remove();
 
     URL.revokeObjectURL(url);
-    showToast(t('options_export_success'), 'success');
+    showToast('Export réussi', 'success');
   } catch (error) {
-    showToast(t('options_export_error'), 'error');
+    showToast('Erreur lors de l\'export', 'error');
   }
 }
 
@@ -855,7 +1016,12 @@ async function handleImport(event) {
 
   try {
     const data = JSON.parse(await file.text());
-    if (!data.exportDate) throw new Error(t('options_invalid_file'));
+    if (!data.exportDate || typeof data !== 'object') throw new Error('Fichier invalide');
+    // Valider les clés attendues
+    const validKeys = ['exportDate', 'version', 'lastStatus', 'lastCheck', 'lastCheckAttempt',
+      'history', 'settings', 'apiData', 'autoCheckMeta', 'checkLog', 'stepDates', '_hasCredentials'];
+    const dataKeys = Object.keys(data);
+    if (!dataKeys.some(k => validKeys.includes(k))) throw new Error('Fichier invalide');
 
     await storage.importData(data);
     await loadHistory();
@@ -867,18 +1033,19 @@ async function handleImport(event) {
     } catch (e) { /* ignore */ }
     await loadAutoCheckStatus();
 
-    showToast(t('options_import_success'), 'success');
+    showToast('Import réussi', 'success');
   } catch (error) {
-    showToast(t('options_import_error'), 'error');
+    showToast('Erreur lors de l\'import', 'error');
   }
 
   event.target.value = '';
 }
 
 async function handleClearAll() {
-  if (!confirm(t('options_confirm_delete_all'))) return;
+  if (!confirm('Supprimer toutes les données (historique, paramètres) ?\nVos identifiants de connexion seront conservés.\nCette action est irréversible.')) return;
 
   await storage.clearExceptCredentials();
+  try { await chrome.action.setBadgeText({ text: '' }); } catch (e) { /* ignore */ }
   await loadHistory();
   await loadSettings();
 
@@ -889,7 +1056,7 @@ async function handleClearAll() {
   await loadAutoCheckStatus();
   await loadCheckLog();
 
-  showToast(t('options_data_deleted'), 'success');
+  showToast('Données supprimées (identifiants conservés)', 'success');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -904,7 +1071,7 @@ async function loadLogs() {
       elements.logsContainer.innerHTML = `
         <div class="empty-state">
           <span class="empty-icon">📋</span>
-          <p>${t('options_no_logs')}</p>
+          <p>Aucun log disponible</p>
         </div>
       `;
       return;
@@ -926,7 +1093,7 @@ async function loadLogs() {
     elements.logsContainer.innerHTML = `
       <div class="empty-state">
         <span class="empty-icon">❌</span>
-        <p>${t('options_log_error')}</p>
+        <p>Erreur de chargement</p>
       </div>
     `;
   }
@@ -936,7 +1103,7 @@ async function handleClearLogs() {
   try {
     await chrome.runtime.sendMessage({ type: 'CLEAR_LOGS' });
     await loadLogs();
-    showToast(t('options_logs_cleared'), 'success');
+    showToast('Logs effacés', 'success');
   } catch (error) {
     showToast('Erreur', 'error');
   }
@@ -947,6 +1114,7 @@ async function handleClearLogs() {
 // ─────────────────────────────────────────────────────────────
 
 function showToast(message, type = 'info') {
+  if (!elements.toast) return;
   elements.toast.textContent = message;
   elements.toast.className = `toast ${type} show`;
   setTimeout(() => elements.toast.classList.remove('show'), 3000);

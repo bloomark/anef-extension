@@ -11,8 +11,7 @@
 import * as storage from '../lib/storage.js';
 import { getStatusExplanation, isPositiveStatus, isNegativeStatus, getStepColor, formatTimestamp, formatSubStep } from '../lib/status-parser.js';
 import { ANEF_BASE_URL, ANEF_ROUTES, URLPatterns, LogConfig } from '../lib/constants.js';
-import { sendAnonymousStats, sendManualStepDates, fetchDossierSnapshots } from '../lib/anonymous-stats.js';
-import { t } from '../lib/i18n-helper.js';
+import { sendAnonymousStats, sendManualStepDates, rehydrateLocalHistoryFromServer } from '../lib/anonymous-stats.js';
 
 // ─────────────────────────────────────────────────────────────
 // Configuration
@@ -82,7 +81,7 @@ async function cleanupOrphanedWindow() {
     if (savedWindowId) {
       try {
         await chrome.windows.remove(savedWindowId);
-        logger.info('🗑️ Orphaned window closed:', savedWindowId);
+        logger.info('🗑️ Fenêtre orpheline fermée:', savedWindowId);
       } catch {
         // Fenêtre déjà fermée, ok
       }
@@ -100,7 +99,7 @@ cleanupOrphanedWindow();
 // ─────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  logger.debug('Message received:', { type: message.type, from: sender.tab?.url || 'popup' });
+  logger.debug('Message reçu:', { type: message.type, from: sender.tab?.url || 'popup' });
 
   switch (message.type) {
     // Logs du content script
@@ -116,44 +115,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Données du dossier (statut principal)
     case 'DOSSIER_DATA':
-      logger.info('📥 Dossier data received', message.data);
-      handleDossierData(message.data);
+      logger.info('📥 Données dossier reçues', message.data);
+      handleDossierData(message.data).catch(e => logger.error('handleDossierData error', e));
       sendResponse({ received: true });
       break;
 
     // Données du stepper (ID dossier)
     case 'DOSSIER_STEPPER':
-      logger.info('📥 Stepper received', { id: message.data?.dossier?.id });
-      handleDossierStepper(message.data);
+      logger.info('📥 Stepper reçu', { id: message.data?.dossier?.id });
+      handleDossierStepper(message.data).catch(e => logger.error('handleDossierStepper error', e));
       break;
 
     // Données détaillées de l'API
     case 'API_DATA':
-      logger.info('📥 API data received');
-      handleApiData(message.data);
+      logger.info('📥 Données API reçues');
+      handleApiData(message.data).catch(e => logger.error('handleApiData error', e));
       break;
 
     // Notifications ANEF
     case 'NOTIFICATIONS':
-      logger.info('📥 Notifications received', { count: message.data?.length });
-      handleNotifications(message.data);
+      logger.info('📥 Notifications reçues', { count: message.data?.length });
+      handleNotifications(message.data).catch(e => logger.error('handleNotifications error', e));
       break;
 
     // Informations utilisateur
     case 'USER_INFO':
-      logger.info('📥 User info received', message.data);
-      handleUserInfo(message.data);
+      logger.info('📥 Infos utilisateur reçues', message.data);
+      handleUserInfo(message.data).catch(e => logger.error('handleUserInfo error', e));
       break;
 
     // Historique des séjours
     case 'HISTORIQUE':
-      logger.info('📥 History received', message.data);
-      handleHistorique(message.data);
+      logger.info('📥 Historique reçu', message.data);
+      handleHistorique(message.data).catch(e => logger.error('handleHistorique error', e));
       break;
 
     // Page chargée
     case 'PAGE_READY':
-      logger.info('📄 Page ready', message);
+      logger.info('📄 Page prête', message);
       break;
 
     // Navigation SPA
@@ -163,20 +162,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Site en maintenance
     case 'MAINTENANCE':
-      logger.warn('🔧 Maintenance detected');
-      handleMaintenance();
+      logger.warn('🔧 Maintenance détectée');
+      handleMaintenance().catch(e => logger.error('handleMaintenance error', e));
       break;
 
     // Session expirée (JWT invalide / mot de passe expiré)
     case 'EXPIRED_SESSION':
-      logger.warn('🔑 Expired session detected (invalid JWT)');
-      handleExpiredSession();
+      logger.warn('🔑 Session expirée détectée (JWT invalide)');
+      handleExpiredSession().catch(e => logger.error('handleExpiredSession error', e));
       break;
 
     // Résultat de la récupération par le script injecté
     case 'FETCH_COMPLETE':
-      logger.info('📥 Fetch complete:', message.data);
+      logger.info('📥 Fetch terminé:', message.data);
       handleFetchComplete(message.data);
+      break;
+
+    // Signaux du script auto-login (relayés par content-script.js)
+    case 'LOGIN_CLICKED':
+    case 'LOGIN_SUBMITTED':
+    case 'LOGIN_SUCCESS':
+      logger.info('🔐 ' + message.type);
+      handleLoginSignal(message.type, message.data);
+      break;
+    case 'LOGIN_FAILED':
+    case 'NEED_CLICK_LOGIN':
+      logger.warn('🔐 ' + message.type + ':', message.data?.error);
+      handleLoginSignal(message.type, message.data);
       break;
 
     // Récupérer le statut pour le popup
@@ -210,10 +222,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Actualisation en arrière-plan
     case 'BACKGROUND_REFRESH': {
-      logger.info('🔄 Manual refresh requested');
+      logger.info('🔄 Actualisation manuelle demandée');
       const manualStart = Date.now();
-      refreshPromise = backgroundRefresh();
-      refreshPromise.then(async (result) => {
+      const p = backgroundRefresh();
+      refreshPromise = p;
+      p.then(async (result) => {
         // Ne pas loguer les refreshes annulés par une nouvelle demande
         if (result.aborted) {
           sendResponse(result);
@@ -241,8 +254,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Paramètres modifiés → reconfigurer l'alarme auto-check
     case 'SETTINGS_CHANGED':
-      logger.info('⚙️ Settings changed, reconfiguring auto-check');
+      logger.info('⚙️ Paramètres modifiés, reconfiguration auto-check');
       scheduleAutoCheck().then(() => sendResponse({ ok: true }));
+      return true;
+
+    // Test notification (dev/debug)
+    case 'TEST_NOTIFICATION':
+      sendStatusChangeNotification({ statut: message.statut || 'controle_a_effectuer' })
+        .then(() => sendResponse({ sent: true }))
+        .catch(e => sendResponse({ error: e.message }));
       return true;
 
     // Infos auto-check pour l'UI
@@ -260,7 +280,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await sendManualStepDates(stepDates, apiData);
             sendResponse({ success: true });
           } else {
-            sendResponse({ success: false, error: 'No data' });
+            sendResponse({ success: false, error: 'Pas de données' });
           }
         } catch (e) {
           sendResponse({ success: false, error: e.message });
@@ -268,58 +288,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       })();
       return true;
 
-    // Récupérer les snapshots depuis Supabase → stepDates locales
+    // Multi-dossier : définir un nouveau dossier principal
+    case 'SET_PRIMARY_DOSSIER':
+      (async () => {
+        try {
+          await storage.setPrimaryDossier(message.dossierId);
+          const newPrimary = await storage.getPrimaryDossier();
+          if (newPrimary?.lastStatus?.statut) {
+            await updateBadge(newPrimary.lastStatus.statut);
+          }
+          logger.info('⭐ Dossier principal changé:', message.dossierId);
+          // Reprogrammer l'auto-check (creds effacées par setPrimaryDossier → désactivé)
+          await scheduleAutoCheck();
+          sendResponse({ success: true });
+        } catch (e) {
+          logger.error('SET_PRIMARY_DOSSIER error:', e.message);
+          sendResponse({ success: false, error: e.message });
+        }
+      })();
+      return true;
+
+    // Multi-dossier : retirer un dossier secondaire de la liste locale
+    // ⚠️ Ne supprime JAMAIS côté Supabase — règle absolue.
+    case 'REMOVE_DOSSIER':
+      (async () => {
+        try {
+          const removed = await storage.removeDossier(message.dossierId);
+          logger.info('🗑 Dossier retiré (local only):', message.dossierId);
+          sendResponse({ success: !!removed });
+        } catch (e) {
+          logger.error('REMOVE_DOSSIER error:', e.message);
+          sendResponse({ success: false, error: e.message });
+        }
+      })();
+      return true;
+
+    // Récupérer les stepDates depuis chrome.storage.sync (backup auto multi-appareils)
+    // → remplace l'ancien lookup Supabase pour éviter l'exposition par hash.
     case 'PULL_STEP_DATES':
       (async () => {
         try {
-          const apiData = await storage.getApiData();
-          if (!apiData?.dossierId) {
-            sendResponse({ error: 'No known dossier' });
-            return;
-          }
-          const snapshots = await fetchDossierSnapshots(apiData);
-          if (!snapshots.length) {
-            sendResponse({ count: 0 });
-            return;
-          }
-
-          // Reconstruire stepDates depuis la base (source = manual)
-          const pulledStepDates = [];
-          for (const snap of snapshots) {
-            if (snap.date_statut && snap.source === 'manual') {
-              pulledStepDates.push({
-                statut: snap.statut.toLowerCase(),
-                date_statut: snap.date_statut,
-                manual: true,
-                timestamp: snap.checked_at || new Date().toISOString()
-              });
-            }
-          }
-
-          // Merger : la base fait autorité pour les manuels
-          const existing = await storage.getStepDates();
-          const mergedMap = {};
-          for (const sd of existing) {
-            mergedMap[(sd.statut || '').toLowerCase()] = sd;
-          }
-          for (const sd of pulledStepDates) {
-            mergedMap[sd.statut] = sd; // la base écrase le local
-          }
-          await storage.saveStepDates(Object.values(mergedMap));
-
-          // Ajouter à l'historique si absent
-          for (const snap of snapshots) {
-            if (snap.date_statut) {
-              await storage.addToHistory({
-                statut: snap.statut.toLowerCase(),
-                date_statut: snap.date_statut,
-                manual: snap.source === 'manual',
-                timestamp: snap.checked_at || new Date().toISOString()
-              });
-            }
-          }
-
-          sendResponse({ count: pulledStepDates.length });
+          const result = await storage.restoreStepDatesFromSync();
+          sendResponse({ count: result.count });
         } catch (e) {
           sendResponse({ error: e.message });
         }
@@ -327,7 +337,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     default:
-      logger.warn('Unhandled message:', message.type);
+      logger.warn('Message non géré:', message.type);
   }
 });
 
@@ -338,7 +348,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 /** Traite les données du dossier (statut principal) */
 async function handleDossierData(data) {
   if (!data?.statut) {
-    logger.warn('Invalid data - no status');
+    logger.warn('Données invalides - pas de statut');
     return;
   }
 
@@ -351,20 +361,52 @@ async function handleDossierData(data) {
       await storage.saveApiData(apiData);
     }
 
-    // Vérifier si le statut a changé
-    const hasChanged = await storage.hasStatusChanged(data);
-    if (hasChanged) {
-      logger.info('🔔 Status change detected!', { new: data.statut });
+    // ── Routage multi-dossier (v2.6.0+) ──
+    // Chaque dossier a son propre record dans `dossiers[id]`. Pas de wipe :
+    // on écrit dans le record correspondant à data.id. Si c'est un nouveau
+    // dossier, il est ajouté comme secondaire (sauf si aucun primaire défini,
+    // auquel cas upsertDossier le promeut automatiquement).
+    const newId = data.id ? String(data.id) : null;
+    const primaryId = await storage.getPrimaryDossierId();
+    const knownDossiers = await storage.getDossiers();
+    const isKnown = newId && knownDossiers[newId];
+    const isNewSecondary = newId && !isKnown && primaryId && newId !== primaryId;
+
+    // Comparaison de statut SCOPED au dossier reçu (pas le primaire)
+    const prevStatus = newId ? (await storage.getLastStatus(newId)) : null;
+    const hasChanged = !prevStatus
+      || prevStatus.date_statut !== data.date_statut
+      || (prevStatus.statut || '').toLowerCase() !== (data.statut || '').toLowerCase();
+
+    // Écrire les données dans le bon record (saveStatus route via data.id)
+    await storage.saveStatus(data);
+    logger.info('✅ Statut sauvegardé', { dossierId: newId, isNew: isNewSecondary });
+
+    if (isNewSecondary) {
+      // Nouveau dossier détecté → notification informative (pas de wipe)
+      await chrome.storage.local.set({
+        dossierSwitchNotice: {
+          at: new Date().toISOString(),
+          previousId: primaryId,
+          newId: newId,
+          acknowledged: false,
+          isNewSecondary: true
+        }
+      });
+      await sendDossierChangedNotification(newId, primaryId);
+    } else if (hasChanged && newId === primaryId) {
+      // Changement de statut sur le primaire → notification standard
+      logger.info('🔔 Changement de statut détecté !', { nouveau: data.statut });
       await sendStatusChangeNotification(data);
     }
 
-    // Sauvegarder et mettre à jour le badge
-    await storage.saveStatus(data);
-    await updateBadge(data.statut);
-    logger.info('✅ Status saved');
+    // Mettre à jour le badge seulement pour le primaire (ou premier dossier)
+    if (!primaryId || newId === primaryId) {
+      await updateBadge(data.statut);
+    }
 
   } catch (error) {
-    logger.error('Error processing dossier:', error.message);
+    logger.error('Erreur traitement dossier:', error.message);
   }
 }
 
@@ -372,8 +414,24 @@ async function handleDossierData(data) {
 async function handleDossierStepper(data) {
   if (!data?.dossier?.id) return;
 
+  const newId = String(data.dossier.id);
   const apiData = await storage.getApiData() || {};
-  apiData.dossierId = data.dossier.id;
+  const oldId = apiData.dossierId ? String(apiData.dossierId) : null;
+
+  // Détection de changement de dossier : si l'ID actuel diffère du précédent,
+  // on wipe history / stepDates / lastStatus pour éviter le mélange entre
+  // deux dossiers (ex: utilisateur + conjoint sur le même navigateur).
+  // Sans ce reset, les transitions affichées sur le site peuvent être
+  // incohérentes (ex: 11.1 → 8.1) et les stepDates se mélangent.
+  if (oldId && oldId !== newId) {
+    logger.warn('🔀 Changement de dossier détecté, reset des données locales', {
+      oldId, newId
+    });
+    await storage.resetForNewDossier(newId);
+    return;
+  }
+
+  apiData.dossierId = newId;
   await storage.saveApiData(apiData);
 }
 
@@ -397,12 +455,38 @@ async function handleApiData(data) {
   };
 
   await storage.saveApiData(apiData);
-  logger.info('✅ API data saved');
+  logger.info('✅ Données API sauvegardées');
 
-  // Statistiques anonymes communautaires (fire-and-forget)
-  const lastStatus = await storage.getLastStatus();
+  // Statistiques anonymes communautaires + rehydrate post-switch
+  // `lastStatus` doit être celui du dossier dont on traite les données,
+  // pas du primaire (en multi-dossier, les secondaires mettent à jour aussi
+  // leurs snapshots Supabase quand l'user les visite).
+  const lastStatus = await storage.getLastStatus(apiData.dossierId);
   if (lastStatus) {
-    sendAnonymousStats(lastStatus, apiData).catch(() => {});
+    // Lit le flag dossierSwitchNotice.acknowledged=false pour déclencher
+    // la réhydratation complète depuis Supabase lors du changement de dossier.
+    const { dossierSwitchNotice } = await chrome.storage.local.get('dossierSwitchNotice');
+    const isPostSwitch = dossierSwitchNotice && !dossierSwitchNotice.rehydrated
+      && dossierSwitchNotice.newId === apiData.dossierId;
+
+    const result = await sendAnonymousStats(lastStatus, apiData).catch(e => {
+      logger.warn('sendAnonymousStats error', e.message);
+      return null;
+    });
+
+    // Rehydrate local depuis le serveur si on vient de basculer sur un dossier déjà connu
+    if (isPostSwitch && result?.history?.length) {
+      try {
+        const count = await rehydrateLocalHistoryFromServer(result.history, apiData.dossierId);
+        logger.info('🔁 Rehydrate depuis Supabase post-switch', { entrees: count, dossierId: apiData.dossierId });
+        // Marquer comme rehydraté pour éviter de refaire la manip
+        await chrome.storage.local.set({
+          dossierSwitchNotice: { ...dossierSwitchNotice, rehydrated: true }
+        });
+      } catch (e) {
+        logger.warn('Rehydrate échoué', e.message);
+      }
+    }
   }
 }
 
@@ -432,6 +516,21 @@ function handleFetchComplete(data) {
   fetchCompleteSignal = {
     success: data?.success || false,
     reason: data?.reason || null,
+    timestamp: Date.now()
+  };
+}
+
+/**
+ * Signal de résultat du script auto-login (LOGIN_CLICKED, LOGIN_SUBMITTED,
+ * LOGIN_SUCCESS, LOGIN_FAILED, NEED_CLICK_LOGIN). Permet à backgroundRefresh
+ * de réagir immédiatement au lieu d'attendre un sleep de 5-8s puis de boucler.
+ */
+let loginSignal = null;
+
+function handleLoginSignal(type, data) {
+  loginSignal = {
+    type,
+    reason: data?.error || null,
     timestamp: Date.now()
   };
 }
@@ -472,31 +571,66 @@ async function handleHistorique(data) {
 // Notifications
 // ─────────────────────────────────────────────────────────────
 
-/** Envoie une notification de changement de statut */
+/** Envoie une notification discrète de changement de statut */
 async function sendStatusChangeNotification(data) {
   const settings = await storage.getSettings();
-  if (!settings.notificationsEnabled) return;
-
-  const statusInfo = getStatusExplanation(data.statut);
-  let title = '🔔 ' + t('notification_status_change');
-
-  if (isPositiveStatus(data.statut)) {
-    title = '🎉 ' + t('notification_congratulations');
-  } else if (isNegativeStatus(data.statut)) {
-    title = '⚠️ ' + t('notification_update');
+  if (!settings.notificationsEnabled) {
+    logger.info('Notifications désactivées, pas d\'envoi');
+    return;
   }
 
+  const statusInfo = getStatusExplanation(data.statut);
+  let title = 'Nouveau statut ANEF';
+
+  if (isPositiveStatus(data.statut)) {
+    title = 'Bonne nouvelle ANEF !';
+  } else if (isNegativeStatus(data.statut)) {
+    title = 'Mise à jour ANEF';
+  }
+
+  const notifId = 'anef-status-' + Date.now();
+
   try {
-    await chrome.notifications.create({
+    await chrome.notifications.create(notifId, {
       type: 'basic',
-      iconUrl: 'assets/icon-128.png',
+      iconUrl: chrome.runtime.getURL('assets/icon-128.png'),
       title,
-      message: `${statusInfo.phase}: ${statusInfo.explication}`,
-      priority: 2,
-      requireInteraction: true
+      message: `${statusInfo.phase} — ${statusInfo.explication}`,
+      priority: 1,
+      silent: true,
+      requireInteraction: false
     });
+    logger.info('Notification envoyée:', notifId);
   } catch (error) {
-    logger.error('Notification error:', error.message);
+    logger.error('Erreur notification:', error.message);
+  }
+}
+
+// Clic sur la notification → ouvre le popup
+chrome.notifications.onClicked.addListener((notifId) => {
+  if (notifId.startsWith('anef-status-') || notifId.startsWith('anef-dossier-switch-')) {
+    chrome.notifications.clear(notifId);
+  }
+});
+
+/** Notifie l'utilisateur qu'un autre dossier est en cours de suivi */
+async function sendDossierChangedNotification(newId, oldId) {
+  const settings = await storage.getSettings();
+  if (!settings.notificationsEnabled) return;
+  const notifId = 'anef-dossier-switch-' + Date.now();
+  try {
+    await chrome.notifications.create(notifId, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('assets/icon-128.png'),
+      title: 'Dossier ANEF changé',
+      message: 'Un nouveau dossier est désormais suivi. L\'historique local a été réinitialisé pour éviter le mélange de données.',
+      priority: 1,
+      silent: false,
+      requireInteraction: false
+    });
+    logger.info('Notification changement de dossier envoyée', { notifId, newId, oldId });
+  } catch (error) {
+    logger.error('Erreur notification dossier:', error.message);
   }
 }
 
@@ -521,7 +655,7 @@ async function updateBadge(statut) {
         : 'ANEF Status Tracker'
     });
   } catch (error) {
-    logger.error('Badge error:', error.message);
+    logger.error('Erreur badge:', error.message);
   }
 }
 
@@ -531,13 +665,14 @@ async function updateBadge(statut) {
 
 /** Récupère toutes les données pour le popup */
 async function getStatusForPopup() {
-  const [lastStatus, lastCheck, lastCheckAttempt, apiData, history, settings] = await Promise.all([
+  const [lastStatus, lastCheck, lastCheckAttempt, apiData, history, settings, primaryHasCredentials] = await Promise.all([
     storage.getLastStatus(),
     storage.getLastCheck(),
     storage.getLastCheckAttempt(),
     storage.getApiData(),
     storage.getHistory(),
-    storage.getSettings()
+    storage.getSettings(),
+    storage.hasCredentials()  // primaire
   ]);
 
   return {
@@ -548,7 +683,8 @@ async function getStatusForPopup() {
     historyCount: history.length,
     settings,
     inMaintenance: apiData?.inMaintenance || false,
-    passwordExpired: apiData?.passwordExpired || false
+    passwordExpired: apiData?.passwordExpired || false,
+    primaryHasCredentials
   };
 }
 
@@ -564,7 +700,7 @@ async function openAnefPage(page) {
   try {
     await chrome.tabs.create({ url, active: true });
   } catch (error) {
-    logger.error('Error opening tab:', error.message);
+    logger.error('Erreur ouverture onglet:', error.message);
   }
 }
 
@@ -583,6 +719,29 @@ function abortableSleep(ms, signal) {
   return new Promise(resolve => {
     const timer = setTimeout(resolve, ms);
     signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
+/**
+ * Attend jusqu'à `ms` OU jusqu'à ce que `check()` retourne truthy.
+ * Utilisé pour sortir rapidement quand un LOGIN_FAILED / LOGIN_SUCCESS
+ * arrive pendant un sleep post-login, au lieu d'attendre les 5-8s complets.
+ * Retourne 'signal' / 'aborted' / 'timeout'.
+ */
+function sleepUntilSignal(ms, signal, check) {
+  if (signal.aborted) return Promise.resolve('aborted');
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let done = false;
+    const finish = (reason) => { if (!done) { done = true; resolve(reason); } };
+    signal.addEventListener('abort', () => finish('aborted'), { once: true });
+    const tick = () => {
+      if (done) return;
+      if (check()) return finish('signal');
+      if (Date.now() - start >= ms) return finish('timeout');
+      setTimeout(tick, 300);
+    };
+    tick();
   });
 }
 
@@ -614,7 +773,7 @@ function abortableSleep(ms, signal) {
 async function backgroundRefresh() {
   // Si une actualisation est déjà en cours, l'annuler et attendre son nettoyage
   if (isRefreshing && refreshAbortController) {
-    logger.warn('⚠️ Refresh already in progress → cancelling previous');
+    logger.warn('⚠️ Actualisation déjà en cours → annulation de l\'ancienne');
     refreshAbortController.abort();
     if (refreshPromise) {
       try { await refreshPromise; } catch {}
@@ -624,7 +783,14 @@ async function backgroundRefresh() {
   const abortController = new AbortController();
   refreshAbortController = abortController;
   isRefreshing = true;
-  logger.info('🔄 Starting refresh...');
+  logger.info('🔄 Démarrage actualisation...');
+
+  // v2.6.1 multi-dossier : snapshot du primaire avant refresh
+  // pour détecter si le fetch ramène un autre dossier (user connecté sur un
+  // compte différent sur ANEF).
+  const expectedPrimaryId = await storage.getPrimaryDossierId();
+  const beforePrimaryLastCheck = expectedPrimaryId
+    ? (await storage.getLastCheck(expectedPrimaryId)) : null;
 
   // Configuration des délais
   const TIMEOUT_MS = 45000;       // Timeout sans login
@@ -661,6 +827,14 @@ async function backgroundRefresh() {
   const beforeCheck = await storage.getLastCheck();
   const beforeApiUpdate = preApiData?.lastUpdate;
 
+  // v2.6.1 : snapshot des lastCheck de TOUS les dossiers, pour détecter
+  // qu'un autre dossier (secondaire) a été fetched à la place du primaire.
+  const beforeLastChecksByDossier = {};
+  const _dossiersBefore = await storage.getDossiers();
+  for (const id in _dossiersBefore) {
+    beforeLastChecksByDossier[id] = _dossiersBefore[id].lastCheck || null;
+  }
+
   const credentials = await storage.getCredentials();
   const hasCredentials = !!(credentials?.username && credentials?.password);
 
@@ -680,14 +854,14 @@ async function backgroundRefresh() {
 
       // Naviguer vers l'URL après que la fenêtre soit minimisée
       await chrome.tabs.update(tabId, { url: MON_COMPTE_URL });
-      logger.info('✅ Minimized window created:', { windowId, tabId });
+      logger.info('✅ Fenêtre minimisée créée:', { windowId, tabId });
     } catch (winErr) {
       // Fallback: onglet inactif (si windows.create échoue, ex: ChromeOS)
-      logger.warn('Window creation failed:', winErr.message);
+      logger.warn('Fenêtre impossible:', winErr.message);
       const tab = await chrome.tabs.create({ url: MON_COMPTE_URL, active: false });
       tabId = tab.id;
       useWindow = false;
-      logger.info('✅ Inactive tab created:', { tabId });
+      logger.info('✅ Onglet inactif créé:', { tabId });
     }
 
     // ── Boucle d'attente des données ──
@@ -701,7 +875,7 @@ async function backgroundRefresh() {
 
       // Vérifier si cette actualisation a été annulée par une nouvelle
       if (abortController.signal.aborted) {
-        logger.info('🛑 Refresh cancelled (new one requested)');
+        logger.info('🛑 Actualisation annulée (nouvelle demandée)');
         break;
       }
 
@@ -710,7 +884,7 @@ async function backgroundRefresh() {
       try {
         tabInfo = await chrome.tabs.get(tabId);
       } catch {
-        logger.warn('Tab closed prematurely');
+        logger.warn('Onglet fermé prématurément');
         break;
       }
 
@@ -728,19 +902,19 @@ async function backgroundRefresh() {
 
         // Si on arrive sur la page d'accueil après login, naviguer vers mon-compte
         if (isOnHomepage && (loginAttempted.anef || loginAttempted.sso) && !loginCompleted) {
-          logger.info('🏠 Homepage detected after login, navigating to mon-compte...');
+          logger.info('🏠 Page d\'accueil détectée après login, navigation vers mon-compte...');
           try {
             await chrome.tabs.update(tabId, { url: MON_COMPTE_URL });
-            logger.info('📤 Navigation to mon-compte started');
+            logger.info('📤 Navigation vers mon-compte lancée');
           } catch (e) {
-            logger.warn('Navigation error:', e.message);
+            logger.warn('Erreur navigation:', e.message);
           }
           lastUrl = currentUrl;
           continue;
         }
 
         if (isOnMonCompte && (loginAttempted.anef || loginAttempted.sso)) {
-          logger.info('✅ Login successful, arrived at mon-compte');
+          logger.info('✅ Connexion réussie, arrivé sur mon-compte');
           loginCompleted = true;
           fetchCompleteSignal = null; // Attendre un nouveau signal post-login
           // Attendre que Angular charge la page
@@ -749,9 +923,9 @@ async function backgroundRefresh() {
           // Déclencher explicitement la récupération des données
           try {
             await chrome.tabs.sendMessage(tabId, { type: 'TRIGGER_DATA_FETCH' });
-            logger.info('📤 Data fetch request sent');
+            logger.info('📤 Demande de récupération envoyée');
           } catch (e) {
-            logger.warn('Error sending TRIGGER_DATA_FETCH:', e.message);
+            logger.warn('Erreur envoi TRIGGER_DATA_FETCH:', e.message);
           }
         }
 
@@ -765,7 +939,7 @@ async function backgroundRefresh() {
 
         // Page de changement de mot de passe (expiré)
         if (URLPatterns.isPasswordExpired(currentUrl)) {
-          logger.warn('🔑 ANEF expired password detected');
+          logger.warn('🔑 Mot de passe ANEF expiré détecté');
           const apiData = await storage.getApiData() || {};
           apiData.passwordExpired = true;
           await storage.saveApiData(apiData);
@@ -774,58 +948,74 @@ async function backgroundRefresh() {
 
         // Page de connexion ANEF détectée
         if (isAnefLogin && !loginAttempted.anef && hasCredentials) {
-          logger.info('🔐 ANEF login page detected');
+          logger.info('🔐 Page connexion ANEF détectée');
           needsLogin = true;
           loginAttempted.anef = true;
           fetchCompleteSignal = null; // Signal pré-login obsolète
+          loginSignal = null;         // Reset signal login pour ce tour
 
-          // Attendre que Angular soit prêt
-          await abortableSleep(3000, abortController.signal);
+          // Attendre que Angular soit prêt (MutationObserver côté auto-login)
+          await abortableSleep(1500, abortController.signal);
           if (abortController.signal.aborted) continue;
 
+          const sendRef = Date.now();
           try {
             await chrome.tabs.sendMessage(tabId, {
               type: 'DO_AUTO_LOGIN',
               credentials
             });
-            logger.info('📤 ANEF auto-login sent');
+            logger.info('📤 Auto-login ANEF envoyé');
           } catch (e) {
-            logger.warn('ANEF auto-login error:', e.message);
+            logger.warn('Erreur auto-login ANEF:', e.message);
           }
 
-          // Attendre la redirection vers SSO
-          await abortableSleep(5000, abortController.signal);
+          // Attendre la redirection ou un signal explicite du script auto-login.
+          // Sort tôt sur LOGIN_CLICKED / LOGIN_FAILED / NEED_CLICK_LOGIN.
+          const result = await sleepUntilSignal(5000, abortController.signal,
+            () => loginSignal && loginSignal.timestamp >= sendRef);
+          if (result === 'signal' && (loginSignal.type === 'LOGIN_FAILED' || loginSignal.type === 'NEED_CLICK_LOGIN')) {
+            logger.warn('⚠️ Login ANEF échoué:', loginSignal.reason);
+            break;
+          }
           continue;
         }
 
         // Page SSO détectée
         if (isSSOPage && !loginAttempted.sso && hasCredentials) {
-          logger.info('🔐 SSO page detected');
+          logger.info('🔐 Page SSO détectée');
           loginAttempted.sso = true;
           fetchCompleteSignal = null; // Signal pré-login obsolète
+          loginSignal = null;
 
-          // Attendre que le formulaire soit prêt
-          await abortableSleep(2000, abortController.signal);
+          // Attendre que le formulaire soit prêt (MutationObserver côté auto-login)
+          await abortableSleep(1000, abortController.signal);
           if (abortController.signal.aborted) continue;
 
+          const sendRef = Date.now();
           try {
             await chrome.tabs.sendMessage(tabId, {
               type: 'DO_AUTO_LOGIN',
               credentials
             });
-            logger.info('📤 SSO auto-login sent');
+            logger.info('📤 Auto-login SSO envoyé');
           } catch (e) {
-            logger.warn('SSO auto-login error:', e.message);
+            logger.warn('Erreur auto-login SSO:', e.message);
           }
 
-          // Attendre la soumission et redirection
-          await abortableSleep(8000, abortController.signal);
+          // Attendre la soumission + redirection, ou sortir tôt sur échec.
+          const result = await sleepUntilSignal(8000, abortController.signal,
+            () => loginSignal && loginSignal.timestamp >= sendRef);
+          if (result === 'signal' && loginSignal.type === 'LOGIN_FAILED') {
+            logger.warn('⚠️ Login SSO échoué:', loginSignal.reason);
+            break;
+          }
           continue;
         }
 
-        // Session expirée sans identifiants
-        if (isAnefLogin && !hasCredentials && elapsed > 10000) {
-          logger.warn('🔒 Session expired, no credentials');
+        // Session expirée sans identifiants — bail après 5s (au lieu de 10s)
+        // car on ne pourra pas auto-login de toute façon
+        if (isAnefLogin && !hasCredentials && elapsed > 5000) {
+          logger.warn('🔒 Session expirée, pas d\'identifiants');
           needsLogin = true;
           break;
         }
@@ -834,7 +1024,7 @@ async function backgroundRefresh() {
       // Vérifier si le script injecté a terminé (succès ou échec)
       if (fetchCompleteSignal && fetchCompleteSignal.timestamp > startTime) {
         if (!fetchCompleteSignal.success) {
-          logger.warn('⚠️ Injected script failed:', fetchCompleteSignal.reason);
+          logger.warn('⚠️ Script injecté a échoué:', fetchCompleteSignal.reason);
           // Si maintenance ou session expirée, sortir immédiatement
           if (fetchCompleteSignal.reason === 'maintenance' || fetchCompleteSignal.reason === 'expired_session') {
             break;
@@ -856,32 +1046,45 @@ async function backgroundRefresh() {
       if (currentApiData?.inMaintenance && currentApiData?.maintenanceDetectedAt) {
         const detectedAt = new Date(currentApiData.maintenanceDetectedAt).getTime();
         if (detectedAt > startTime) {
-          logger.warn('🔧 Maintenance detected during refresh, stopping');
+          logger.warn('🔧 Maintenance détectée pendant le refresh, arrêt');
           break;
         }
       }
 
-      // Vérifier si les données sont arrivées
+      // Vérifier si les données sont arrivées (primaire OU un secondaire)
       const currentCheck = await storage.getLastCheck();
-      if (currentCheck && (!beforeCheck || currentCheck > beforeCheck)) {
-        if (!dossierReceived) {
-          logger.info('✅ Dossier data received!');
-          dossierReceived = true;
-          dossierTime = Date.now();
+      let anyDossierUpdated = currentCheck && (!beforeCheck || currentCheck > beforeCheck);
+      // v2.6.1 : vérifier aussi si un SECONDAIRE a reçu des données (user connecté
+      // sur un autre compte ANEF que le primaire)
+      if (!anyDossierUpdated) {
+        const currentDossiers = await storage.getDossiers();
+        for (const id in currentDossiers) {
+          const prevLc = beforeLastChecksByDossier[id] || '';
+          const curLc = currentDossiers[id].lastCheck || '';
+          if (curLc && curLc > prevLc) {
+            anyDossierUpdated = true;
+            break;
+          }
         }
+      }
+
+      if (anyDossierUpdated && !dossierReceived) {
+        logger.info('✅ Données dossier reçues !');
+        dossierReceived = true;
+        dossierTime = Date.now();
       }
 
       // Attendre aussi les données API si possible
       if (dossierReceived) {
         const currentApiUpdate = (await storage.getApiData())?.lastUpdate;
         if (currentApiUpdate && (!beforeApiUpdate || currentApiUpdate > beforeApiUpdate)) {
-          logger.info('✅ API data received!');
+          logger.info('✅ Données API reçues !');
           dataReceived = true;
           break;
         }
         // Timeout pour les données API (8 secondes au lieu de 5)
         if (Date.now() - dossierTime > 8000) {
-          logger.info('⏱️ API data timeout, continuing with dossier data');
+          logger.info('⏱️ Timeout données API, on continue avec les données dossier');
           dataReceived = true;
           break;
         }
@@ -892,25 +1095,70 @@ async function backgroundRefresh() {
     if (useWindow && windowId) {
       try {
         await chrome.windows.remove(windowId);
-        logger.info('🗑️ Window closed');
+        logger.info('🗑️ Fenêtre fermée');
       } catch {}
       await chrome.storage.local.remove(REFRESH_WINDOW_KEY).catch(() => {});
     } else if (tabId) {
       try {
         await chrome.tabs.remove(tabId);
-        logger.info('🗑️ Tab closed');
+        logger.info('🗑️ Onglet fermé');
       } catch {}
     }
 
     // Si annulée par une nouvelle actualisation, sortir sans résultat d'erreur
     if (abortController.signal.aborted) {
-      return { success: false, aborted: true, error: 'Cancelled (new refresh requested)' };
+      return { success: false, aborted: true, error: 'Annulée (nouvelle actualisation demandée)' };
     }
+
+    // ── Helper : détecter un dossier secondaire fetched pendant ce refresh ──
+    // Priorité sur toutes les autres conclusions (maintenance, timeout, ...)
+    // car ça résout explicitement un cas concret : user connecté sur un autre
+    // compte ANEF que le primaire de l'extension.
+    async function _detectUnexpectedDossier() {
+      if (!expectedPrimaryId) return null;
+      try {
+        const dossiers = await storage.getDossiers();
+        let fetchedId = null;
+        let mostRecent = '';
+        for (const id in dossiers) {
+          if (id === expectedPrimaryId) continue;
+          const prevLc = beforeLastChecksByDossier[id] || '';
+          const curLc = dossiers[id].lastCheck || '';
+          if (curLc && curLc > prevLc && curLc > mostRecent) {
+            mostRecent = curLc;
+            fetchedId = id;
+          }
+        }
+        if (!fetchedId) return null;
+        return {
+          fetchedId,
+          fetchedNumero: dossiers[fetchedId]?.apiData?.numeroNational || null,
+          expectedId: expectedPrimaryId,
+          expectedNumero: dossiers[expectedPrimaryId]?.apiData?.numeroNational || null
+        };
+      } catch (e) {
+        logger.warn('_detectUnexpectedDossier failed:', e.message);
+        return null;
+      }
+    }
+
+    // v2.6.1 : check prioritaire — un secondaire a-t-il été fetched ?
+    const unexpected = await _detectUnexpectedDossier();
 
     // ── Résultat ──
     if (dataReceived) {
-      logger.info('✅ Refresh successful');
+      logger.info('✅ Actualisation réussie');
+      if (unexpected) {
+        return { success: true, unexpectedDossier: unexpected };
+      }
       return { success: true };
+    }
+
+    // Si on a reçu des données pour un autre dossier mais le loop a timeout
+    // → c'est quand même un "mauvais compte", pas une vraie maintenance
+    if (unexpected) {
+      logger.info('✅ Autre dossier fetched (user connecté sur autre compte ANEF)');
+      return { success: true, unexpectedDossier: unexpected };
     }
 
     // Vérifier si c'est une maintenance
@@ -918,13 +1166,13 @@ async function backgroundRefresh() {
     if (finalApiData?.inMaintenance && finalApiData?.maintenanceDetectedAt) {
       const detectedAt = new Date(finalApiData.maintenanceDetectedAt).getTime();
       if (detectedAt > startTime) {
-        return { success: false, error: 'ANEF site under maintenance. Try again later.', maintenance: true };
+        return { success: false, error: 'Site ANEF en maintenance. Réessayez plus tard.', maintenance: true };
       }
     }
 
     // Mot de passe expiré
     if (finalApiData?.passwordExpired) {
-      return { success: false, error: 'Your ANEF password has expired. Renew it on the ANEF portal.', passwordExpired: true };
+      return { success: false, error: 'Votre mot de passe ANEF a expiré. Renouvelez-le sur le portail ANEF.', passwordExpired: true };
     }
 
     if (needsLogin && !hasCredentials) {
@@ -932,17 +1180,17 @@ async function backgroundRefresh() {
     }
 
     if ((loginAttempted.anef || loginAttempted.sso) && !loginCompleted) {
-      return { success: false, error: 'Login attempted but failed. Check your credentials.' };
+      return { success: false, error: 'Connexion tentée mais échec. Vérifiez vos identifiants.' };
     }
 
     if (loginCompleted && !dataReceived) {
-      return { success: false, error: 'Login successful but data not retrieved. Try again.' };
+      return { success: false, error: 'Connexion réussie mais données non récupérées. Réessayez.' };
     }
 
-    return { success: false, error: 'Timeout - no data received.' };
+    return { success: false, error: 'Délai dépassé - pas de données reçues.' };
 
   } catch (error) {
-    logger.error('Refresh error:', error.message);
+    logger.error('Erreur actualisation:', error.message);
 
     if (useWindow && windowId) {
       try { await chrome.windows.remove(windowId); } catch {}
@@ -966,7 +1214,7 @@ async function backgroundRefresh() {
 
 const ALARM_NAME = 'anef-auto-check';
 const ALARM_RETRY_NAME = 'anef-auto-check-retry';
-const COOLDOWN_MINUTES = 60; // 1h
+const COOLDOWN_MINUTES = 45; // 45 min (marge sous l'intervalle de 60 min)
 
 /**
  * Configure ou annule l'alarme de vérification automatique
@@ -982,7 +1230,7 @@ async function scheduleAutoCheck() {
   await chrome.alarms.clear(ALARM_RETRY_NAME);
 
   if (!settings.autoCheckEnabled || !hasCreds) {
-    logger.info('⏹️ Auto-check disabled', {
+    logger.info('⏹️ Auto-check désactivé', {
       enabled: settings.autoCheckEnabled,
       creds: hasCreds
     });
@@ -993,7 +1241,7 @@ async function scheduleAutoCheck() {
   // Backoff progressif : après des échecs consécutifs, augmenter l'intervalle
   const baseInterval = settings.autoCheckInterval || 90;
   const failures = meta.consecutiveFailures || 0;
-  const backoffMultiplier = failures > 0 ? Math.min(Math.pow(1.5, failures), 4) : 1; // cap x4 = ~12h
+  const backoffMultiplier = failures > 0 ? Math.min(Math.pow(1.5, failures), 4) : 1; // cap x4 = ~4h (60×4)
   const intervalMinutes = Math.round(baseInterval * backoffMultiplier);
   const jitter = settings.autoCheckJitterMin || 0;
 
@@ -1007,16 +1255,16 @@ async function scheduleAutoCheck() {
     if (elapsedMin >= intervalMinutes) {
       // En retard (PC éteint, navigateur fermé...) → check rapide avec petit jitter
       delayMinutes = Math.floor(Math.random() * 3) + 1; // 1-3 min
-      delayReason = `overdue by ${Math.round(elapsedMin - intervalMinutes)} min`;
+      delayReason = `en retard de ${Math.round(elapsedMin - intervalMinutes)} min`;
     } else {
       // Pas encore l'heure → attendre le temps restant
       delayMinutes = Math.max(1, Math.round(intervalMinutes - elapsedMin));
-      delayReason = `remaining cycle time`;
+      delayReason = `temps restant du cycle`;
     }
   } else {
     // Jamais vérifié → délai normal avec jitter
     delayMinutes = jitter + 1;
-    delayReason = 'first check';
+    delayReason = 'première vérification';
   }
 
   await chrome.alarms.create(ALARM_NAME, {
@@ -1024,10 +1272,10 @@ async function scheduleAutoCheck() {
     periodInMinutes: intervalMinutes
   });
 
-  logger.info('⏰ Auto-check scheduled', {
-    interval: intervalMinutes + ' min' + (failures > 0 ? ` (backoff x${backoffMultiplier.toFixed(1)}, ${failures} failure(s))` : ''),
+  logger.info('⏰ Auto-check programmé', {
+    interval: intervalMinutes + ' min' + (failures > 0 ? ` (backoff x${backoffMultiplier.toFixed(1)}, ${failures} échec(s))` : ''),
     firstIn: delayMinutes + ' min',
-    reason: delayReason
+    raison: delayReason
   });
 }
 
@@ -1038,37 +1286,37 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== ALARM_NAME && alarm.name !== ALARM_RETRY_NAME) return;
 
   const isRetry = alarm.name === ALARM_RETRY_NAME;
-  logger.info(`⏰ Alarm triggered: ${alarm.name}${isRetry ? ' (retry)' : ''}`);
+  logger.info(`⏰ Alarme déclenchée: ${alarm.name}${isRetry ? ' (retry)' : ''}`);
 
   try {
     // Vérifier les prérequis
     const settings = await storage.getSettings();
     if (!settings.autoCheckEnabled) {
-      logger.info('⏹️ Auto-check disabled, skip');
+      logger.info('⏹️ Auto-check désactivé, skip');
       return;
     }
 
     const hasCreds = await storage.hasCredentials();
     if (!hasCreds) {
-      logger.warn('⚠️ No credentials, skip auto-check');
+      logger.warn('⚠️ Pas d\'identifiants, skip auto-check');
       return;
     }
 
-    // Cooldown : skip si dernière tentative < 1h30 (ne s'applique PAS aux retries)
+    // Cooldown : skip si dernière tentative < COOLDOWN_MINUTES (ne s'applique PAS aux retries)
     const meta = await storage.getAutoCheckMeta();
     if (!isRetry && meta.lastAttempt) {
       const elapsed = Date.now() - new Date(meta.lastAttempt).getTime();
       const cooldownMs = COOLDOWN_MINUTES * 60 * 1000;
       if (elapsed < cooldownMs) {
         const remaining = Math.round((cooldownMs - elapsed) / 60000);
-        logger.info(`⏳ Cooldown active, skip (${remaining} min remaining)`);
+        logger.info(`⏳ Cooldown actif, skip (encore ${remaining} min)`);
         return;
       }
     }
 
     // Vérifier qu'un refresh n'est pas déjà en cours
     if (isRefreshing) {
-      logger.warn('⚠️ Refresh already in progress, skip auto-check');
+      logger.warn('⚠️ Refresh déjà en cours, skip auto-check');
       return;
     }
 
@@ -1099,26 +1347,26 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (result.success) {
       // Succès → reset compteur d'échecs
       await storage.saveAutoCheckMeta({ consecutiveFailures: 0 });
-      logger.info(`✅ Auto-check successful (${durationSec}s)`);
+      logger.info(`✅ Auto-check réussi (${durationSec}s)`);
     } else if (result.maintenance) {
       // Maintenance → ne pas compter comme un échec (pas la faute de l'utilisateur)
-      logger.info('🔧 Site under maintenance, not counted as failure');
+      logger.info('🔧 Site en maintenance, ne compte pas comme échec');
     } else if (result.passwordExpired) {
       // Mot de passe expiré → ne pas compter comme échec, pas la faute du système
-      logger.warn('🔑 Password expired, not counted as failure');
+      logger.warn('🔑 Mot de passe expiré, ne compte pas comme échec');
     } else if (result.needsLogin) {
       // Session expirée sans identifiants → ne pas compter comme échec
-      logger.info('🔒 Session expired, credentials required');
+      logger.info('🔒 Session expirée, identifiants requis');
     } else if (result.aborted) {
       // Annulé par un refresh manuel → ne pas compter comme échec
-      logger.info('🛑 Auto-check cancelled by manual refresh');
+      logger.info('🛑 Auto-check annulé par refresh manuel');
     } else {
       // Échec
-      await handleAutoCheckFailure(result.error || 'Unknown failure', isRetry);
+      await handleAutoCheckFailure(result.error || 'Échec inconnu', isRetry);
     }
 
   } catch (error) {
-    logger.error('❌ Auto-check error:', error.message);
+    logger.error('❌ Erreur auto-check:', error.message);
     await storage.addCheckLogEntry({
       type: isRetry ? 'retry' : 'auto',
       success: false,
@@ -1141,7 +1389,7 @@ async function handleAutoCheckFailure(reason, isRetry) {
 
   const failures = isRetry ? (meta.consecutiveFailures || 0) : (meta.consecutiveFailures || 0) + 1;
 
-  logger.warn(`⚠️ Auto-check failed (${failures})`, { reason, isRetry });
+  logger.warn(`⚠️ Auto-check échoué (${failures})`, { reason, isRetry });
 
   if (!isRetry) {
     await storage.saveAutoCheckMeta({ consecutiveFailures: failures });
@@ -1157,13 +1405,13 @@ async function handleAutoCheckFailure(reason, isRetry) {
       delayInMinutes: intervalMinutes,
       periodInMinutes: intervalMinutes
     });
-    logger.info('⏰ Auto-check rescheduled', {
+    logger.info('⏰ Auto-check reprogrammé', {
       interval: intervalMinutes + ' min',
-      backoff: `x${backoffMultiplier.toFixed(1)} (${failures} failure(s))`
+      backoff: `x${backoffMultiplier.toFixed(1)} (${failures} échec(s))`
     });
     // Planifier un retry à +30 min
     await chrome.alarms.create(ALARM_RETRY_NAME, { delayInMinutes: 30 });
-    logger.info('🔄 Retry scheduled in 30 min');
+    logger.info('🔄 Retry programmé dans 30 min');
   }
 }
 
@@ -1197,18 +1445,36 @@ async function getAutoCheckInfo() {
 // ─────────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(async (details) => {
-  logger.info('🚀 Extension installed:', details.reason);
+  logger.info('🚀 Extension installée:', details.reason);
+
+  // Migration multi-dossier v2.6.0 : encapsuler les données v2.5.x dans
+  // dossiers[id]. Idempotent — ne fait rien si déjà migré ou rien à migrer.
+  try {
+    const migrated = await storage.migrateToMultiDossier();
+    if (migrated) logger.info('✅ Migration v2.6.0 multi-dossier effectuée');
+  } catch (e) {
+    logger.error('Migration multi-dossier échouée:', e.message);
+  }
+
+  // v2.6.2+ safety net : si les creds ont disparu (bug antérieur ou migration
+  // ratée), essayer de les restaurer depuis le backup pré-migration.
+  try {
+    const recovered = await storage.recoverCredentialsIfLost();
+    if (recovered) logger.warn('⚠️ Credentials restaurées depuis backup pré-migration');
+  } catch (e) {
+    logger.error('Recovery credentials échoué:', e.message);
+  }
 
   if (details.reason === 'install') {
     // Générer un jitter aléatoire unique pour cette installation (0-60 min)
     const jitter = Math.floor(Math.random() * 60);
     await storage.saveSettings({ ...storage.DEFAULT_SETTINGS, autoCheckJitterMin: jitter });
-    logger.info('🎲 Auto-check jitter generated:', jitter + ' min');
+    logger.info('🎲 Jitter auto-check généré:', jitter + ' min');
 
     // Tenter de restaurer l'historique depuis sync (migration ou nouveau dossier)
     const restored = await storage.restoreFromSync();
     if (restored) {
-      logger.info('✅ Data restored from sync');
+      logger.info('✅ Données restaurées depuis sync');
       const lastStatus = await storage.getLastStatus();
       if (lastStatus?.statut) await updateBadge(lastStatus.statut);
     }
@@ -1220,7 +1486,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     // (ne pas forcer si l'utilisateur l'a volontairement désactivé)
     if (!currentSettings.autoCheckEnabled && !currentSettings._autoCheckMigrated) {
       await storage.saveSettings({ autoCheckEnabled: true, _autoCheckMigrated: true });
-      logger.info('✅ Auto-check enabled (initial migration)');
+      logger.info('✅ Auto-check activé (migration initiale)');
     } else if (!currentSettings._autoCheckMigrated) {
       await storage.saveSettings({ _autoCheckMigrated: true });
     }
@@ -1228,12 +1494,14 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     if (!currentSettings.autoCheckJitterMin) {
       const jitter = Math.floor(Math.random() * 60);
       await storage.saveSettings({ autoCheckJitterMin: jitter });
-      logger.info('🎲 Auto-check jitter generated (migration):', jitter + ' min');
+      logger.info('🎲 Jitter auto-check généré (migration):', jitter + ' min');
     }
-    // Migration : forcer l'intervalle à 90 min
-    if (currentSettings.autoCheckInterval !== 90) {
-      await storage.saveSettings({ autoCheckInterval: 90 });
-      logger.info('⏰ Auto-check interval corrected:', currentSettings.autoCheckInterval, '→ 90 min');
+    // Migration : forcer l'intervalle à 60 min (une seule fois — flag _intervalMigrated60)
+    if (currentSettings.autoCheckInterval !== 60 && !currentSettings._intervalMigrated60) {
+      await storage.saveSettings({ autoCheckInterval: 60, _intervalMigrated60: true });
+      logger.info('⏰ Intervalle auto-check corrigé:', currentSettings.autoCheckInterval, '→ 60 min');
+    } else if (!currentSettings._intervalMigrated60) {
+      await storage.saveSettings({ _intervalMigrated60: true });
     }
     // Migration v2.2.0 : supprimer disabledByFailure obsolète, reset compteur
     const meta = await storage.getAutoCheckMeta();
@@ -1245,15 +1513,15 @@ chrome.runtime.onInstalled.addListener(async (details) => {
           consecutiveFailures: 0
         }
       });
-      logger.info('🔄 Migration: disabledByFailure removed, counter reset');
+      logger.info('🔄 Migration: disabledByFailure supprimé, compteur reset');
     }
 
     // Vérifier l'intégrité des identifiants après mise à jour
     const credCheck = await storage.verifyCredentialsIntegrity();
     if (credCheck.status === 'ok') {
-      logger.info('✅ Credentials intact after update');
+      logger.info('✅ Identifiants intacts après mise à jour');
     } else if (credCheck.status === 'corrupted') {
-      logger.warn('⚠️ Credentials corrupted after update');
+      logger.warn('⚠️ Identifiants corrompus après mise à jour');
     }
 
     // Sauvegarder les données actuelles vers sync après mise à jour
@@ -1267,7 +1535,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 });
 
 chrome.runtime.onStartup.addListener(async () => {
-  logger.info('🚀 Extension started');
+  logger.info('🚀 Extension démarrée');
 
   // Nettoyer les fenêtres orphelines (veille, redémarrage, crash)
   await cleanupOrphanedWindow();
@@ -1275,13 +1543,6 @@ chrome.runtime.onStartup.addListener(async () => {
   const lastStatus = await storage.getLastStatus();
   if (lastStatus?.statut) {
     await updateBadge(lastStatus.statut);
-  }
-
-  // Migration ponctuelle : forcer l'intervalle à 90 min
-  const currentSettings = await storage.getSettings();
-  if (currentSettings.autoCheckInterval !== 90) {
-    await storage.saveSettings({ autoCheckInterval: 90 });
-    logger.info('⏰ Auto-check interval corrected:', currentSettings.autoCheckInterval, '→ 90 min');
   }
 
   // Synchroniser le backup au démarrage
@@ -1302,12 +1563,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
     const oldEnabled = changes.settings.oldValue?.autoCheckEnabled;
     const newEnabled = changes.settings.newValue?.autoCheckEnabled;
     if (oldEnabled !== newEnabled) {
-      logger.info('⚙️ autoCheckEnabled changed via storage:', oldEnabled, '→', newEnabled);
-      scheduleAutoCheck();
+      logger.info('⚙️ autoCheckEnabled changé via storage:', oldEnabled, '→', newEnabled);
+      scheduleAutoCheck().catch(e => logger.error('scheduleAutoCheck error', e));
     }
   }
 });
 
 // ─────────────────────────────────────────────────────────────
 
-logger.info('=== Service Worker initialized ===');
+logger.info('=== Service Worker initialisé ===');

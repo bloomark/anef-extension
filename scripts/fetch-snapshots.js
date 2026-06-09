@@ -8,7 +8,7 @@
  * Used by GitHub Actions (refresh-data.yml + deploy-stats.yml) to generate
  * docs/data/snapshots.json so the site loads from GitHub Pages (0 Supabase egress).
  *
- * Usage: SUPABASE_URL=... SUPABASE_ANON_KEY=... node scripts/fetch-snapshots.js
+ * Usage: SUPABASE_URL=... SUPABASE_SERVICE_KEY=... node scripts/fetch-snapshots.js
  */
 'use strict';
 
@@ -16,14 +16,16 @@ const fs = require('fs');
 const path = require('path');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
 const PAGE_SIZE = 1000;
 const OUT_DIR = path.join(__dirname, '..', 'docs', 'data');
 const OUT_FILE = path.join(OUT_DIR, 'snapshots.json');
 
-// Only columns the site actually uses (data.js processing functions)
+// Only columns the site actually uses (data.js processing functions).
+// IMPORTANT : on expose public_id (HMAC serveur) mais PAS dossier_hash
+// (SHA-256 réversible par rainbow table sur les numéros de dossier).
 const COLUMNS = [
-  'dossier_hash', 'statut', 'etape', 'phase',
+  'public_id', 'statut', 'etape', 'phase',
   'date_depot', 'date_statut', 'date_entretien',
   'prefecture', 'domicile_code_postal', 'lieu_entretien',
   'numero_decret', 'has_complement', 'source',
@@ -33,7 +35,7 @@ const COLUMNS = [
 const STALE_HOURS = 6;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars');
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY env vars');
   process.exit(1);
 }
 
@@ -43,12 +45,16 @@ async function fetchAllSnapshots() {
 
   while (true) {
     var url = SUPABASE_URL + '/rest/v1/dossier_snapshots?select=' + COLUMNS + '&order=created_at.desc&limit=' + PAGE_SIZE + '&offset=' + offset;
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 30000);
     var res = await fetch(url, {
       headers: {
         'apikey': SUPABASE_KEY,
         'Authorization': 'Bearer ' + SUPABASE_KEY
-      }
+      },
+      signal: controller.signal
     });
+    clearTimeout(timer);
     if (!res.ok) {
       throw new Error('Supabase API error: ' + res.status + ' ' + (await res.text()));
     }

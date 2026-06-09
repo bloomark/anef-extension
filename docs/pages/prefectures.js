@@ -66,20 +66,24 @@
   });
 
   function initFilters() {
-    // Build unique sorted prefecture list
+    // Build unique sorted prefecture list + statuts présents dans les dossiers
     var prefSet = {};
+    var statusSet = {};
     for (var i = 0; i < state.summaries.length; i++) {
       var p = state.summaries[i].prefecture;
       if (p) prefSet[p] = true;
+      var st = (state.summaries[i].statut || '').toLowerCase();
+      if (st) statusSet[st] = true;
     }
     var prefList = Object.keys(prefSet).sort();
+    var availableList = Object.keys(statusSet);
 
     F.createPrefectureMultiSelect('filter-prefecture-container', prefList, state.filters.prefecture, function(v) {
       state.filters.prefecture = v; state.tablePage = 1; state.barPage = 1; state.hmPage = 1; state.distribPage = 1; syncAndRender();
     });
     F.createStatusFilter('filter-status-container', state.filters.statut, function(v) {
       state.filters.statut = v; state.tablePage = 1; state.barPage = 1; state.hmPage = 1; state.distribPage = 1; syncAndRender();
-    });
+    }, { filterStatuses: availableList });
   }
 
   function syncAndRender() {
@@ -87,15 +91,34 @@
     renderAll();
   }
 
+  // Signature des filtres actifs : sert de clé de cache pour les dérivés coûteux
+  // (filtered, prefStats, matrice heatmap). Tri/pagination ne changent PAS le
+  // filtre → on réutilise le cache au lieu de tout recalculer.
+  function filterSig() {
+    var p = state.filters.prefecture;
+    return state.filters.statut + '||' + (Array.isArray(p) ? p.slice().sort().join(',') : p);
+  }
+
   function getFiltered() {
-    return D.applyFilters(state.summaries, state.filters);
+    var sig = filterSig();
+    if (state._derivedSig !== sig) {
+      state._filtered = D.applyFilters(state.summaries, state.filters);
+      state._prefStats = D.computePrefectureStats(state._filtered);
+      state._derivedSig = sig;
+    }
+    return state._filtered;
   }
 
   function renderAll() {
     var filtered = getFiltered();
-    var prefStats = D.computePrefectureStats(filtered);
+    var prefStats = state._prefStats;
 
-    document.getElementById('filter-count').textContent = filtered.length + ' dossiers, ' + prefStats.length + ' préfectures';
+    var countEl = document.getElementById('filter-count');
+    if (filtered.length === 0) {
+      countEl.textContent = 'Aucun dossier ne correspond aux filtres';
+    } else {
+      countEl.textContent = filtered.length + ' dossiers, ' + prefStats.length + ' préfectures';
+    }
 
     renderRankingTable(prefStats);
     renderBarChart(prefStats);
@@ -219,10 +242,9 @@
       if (state.tablePage > 1) { state.tablePage--; renderAll(); }
     });
     document.getElementById('ranking-btn-next').addEventListener('click', function() {
-      var filtered = getFiltered();
-      var prefStats = D.computePrefectureStats(filtered);
+      getFiltered(); // assure le cache state._prefStats
       var pageSize = state.tablePageSize;
-      var totalPages = pageSize > 0 ? Math.ceil(prefStats.length / pageSize) : 1;
+      var totalPages = pageSize > 0 ? Math.ceil(state._prefStats.length / pageSize) : 1;
       if (state.tablePage < totalPages) { state.tablePage++; renderAll(); }
     });
   }
@@ -366,33 +388,20 @@
     }
 
     // Build matrix: prefecture x (step or statut for step 9) => days spent AT each step
-    var matrix = {};
+    // Use state.grouped (already deduplicated and sorted by groupByDossier)
+    // Matrice préfecture×étape : ne dépend que du filtre. Cache par signature pour
+    // éviter de re-scanner ~9000 snapshots (regex + daysDiff) sur pagination/tri.
+    var _hmSig = filterSig();
+    var matrix, globalMax;
+    if (state._hmSig === _hmSig && state._hmMatrix) {
+      matrix = state._hmMatrix; globalMax = state._hmMax;
+    } else {
+    matrix = {};
     var allHashes = new Set(filtered.map(function(s) { return s.fullHash; }));
-    var relevantSnaps = state.snapshots.filter(function(s) { return allHashes.has(s.dossier_hash); });
-
-    // Group snapshots by dossier, sort chronologically
-    var byDossier = {};
-    for (var i = 0; i < relevantSnaps.length; i++) {
-      var s = relevantSnaps[i];
-      if (!s.dossier_hash || !s.date_statut) continue;
-      if (!byDossier[s.dossier_hash]) byDossier[s.dossier_hash] = [];
-      byDossier[s.dossier_hash].push(s);
-    }
 
     var today = new Date();
-    var dossierKeys = Object.keys(byDossier);
-    for (var d = 0; d < dossierKeys.length; d++) {
-      var snaps = byDossier[dossierKeys[d]];
-      snaps.sort(function(a, b) {
-        var dateDiff = new Date(a.date_statut || 0) - new Date(b.date_statut || 0);
-        if (dateDiff !== 0) return dateDiff;
-        var stepDiff = Number(a.etape) - Number(b.etape);
-        if (stepDiff !== 0) return stepDiff;
-        // Même étape + même date → trier par rang (sous-statut)
-        var rangA = (C.STATUTS[(a.statut || '').toLowerCase()] || {}).rang || (a.etape * 100);
-        var rangB = (C.STATUTS[(b.statut || '').toLowerCase()] || {}).rang || (b.etape * 100);
-        return rangA - rangB;
-      });
+    state.grouped.forEach(function(snaps, hash) {
+      if (!allHashes.has(hash)) return;
 
       for (var j = 0; j < snaps.length; j++) {
         var cur = snaps[j];
@@ -406,15 +415,15 @@
         if (j + 1 < snaps.length) {
           endDate = snaps[j + 1].date_statut;
         } else {
-          // Dernier snapshot — figer si dossier terminé
-          var isTerminated = C.isFinished({ etape: cur.etape, statut: cur.statut });
+          // Dernier snapshot — figer si dossier clôturé (hors étape 11 en attente JO)
+          var isTerminated = C.isFinished({ etape: cur.etape, statut: cur.statut }) && Number(cur.etape) !== 11;
           endDate = isTerminated ? cur.date_statut : today;
         }
         if (!endDate) continue;
         var days = U.daysDiff(cur.date_statut, endDate);
         if (days === null || days < 0) continue;
 
-        var entry = { days: days, hash: dossierKeys[d].substring(0, 6) };
+        var entry = { days: days, hash: D.displayIdForFullHash(hash) };
         var sLower = cur.statut ? cur.statut.toLowerCase() : '';
         if (Number(cur.etape) === 9 && sLower && STEP9_STATUTS.indexOf(sLower) !== -1) {
           var sKey = pref + '|' + sLower;
@@ -426,16 +435,18 @@
           matrix[eKey].push(entry);
         }
       }
-    }
+    });
 
     // Find global max for color scaling
-    var globalMax = 0;
+    globalMax = 0;
     var mKeys = Object.keys(matrix);
     for (var k = 0; k < mKeys.length; k++) {
       var arr = matrix[mKeys[k]];
       var sum = 0; for (var s2 = 0; s2 < arr.length; s2++) sum += arr[s2].days;
       var avg = sum / arr.length;
       if (avg > globalMax) globalMax = avg;
+    }
+    state._hmMatrix = matrix; state._hmMax = globalMax; state._hmSig = _hmSig;
     }
 
     var prefs = prefStats.map(function(p) { return p.prefecture; });
@@ -532,9 +543,12 @@
   // ─── Dossier detail modal (for heatmap links) ──────────
 
   function showHmDossierDetail(hash) {
-    // Find all snapshots for this dossier
+    // `hash` est le displayId (token aléatoire per-session). Retrouver les
+    // snapshots en comparant leur displayId (dérivé de public_id ou fallback
+    // dossier_hash pour JSON legacy).
     var snaps = state.snapshots.filter(function(s) {
-      return s.dossier_hash && s.dossier_hash.substring(0, 6) === hash;
+      var k = s.public_id || s.dossier_hash;
+      return k && D.displayIdForFullHash(k) === hash;
     }).sort(function(a, b) {
       var stepDiff = Number(a.etape) - Number(b.etape);
       if (stepDiff !== 0) return stepDiff;
@@ -543,9 +557,60 @@
 
     if (!snaps.length) return;
 
+    // Enrichir avec jalons synthétiques : Dépôt + Entretien (si dates connues).
+    var events = snaps.slice();
+    var firstSnap = snaps[0] || {};
+    var dateDepot = firstSnap.date_depot || null;
+    var dateEntretien = null;
+    for (var ei = 0; ei < snaps.length; ei++) {
+      if (snaps[ei].date_entretien) { dateEntretien = snaps[ei].date_entretien; break; }
+    }
+    if (dateDepot) {
+      events.push({ _synthetic: 'deposit', date_statut: dateDepot, etape: 2 });
+    }
+    if (dateEntretien) {
+      events.push({ _synthetic: 'interview', date_statut: dateEntretien, etape: 7 });
+    }
+    events.sort(function(a, b) {
+      var da = a.date_statut || '', db = b.date_statut || '';
+      if (da !== db) return da < db ? -1 : 1;
+      return (a.etape || 0) - (b.etape || 0);
+    });
+
     var timelineHtml = '';
-    for (var j = 0; j < snaps.length; j++) {
-      var snap = snaps[j];
+    for (var j = 0; j < events.length; j++) {
+      var snap = events[j];
+
+      if (snap._synthetic === 'deposit' || snap._synthetic === 'interview') {
+        var synthLabel = snap._synthetic === 'deposit' ? '📨 Dépôt du dossier' : '🗣️ Entretien d\'assimilation';
+        var synthExpl = snap._synthetic === 'deposit'
+          ? 'Date officielle de dépôt'
+          : 'Date de l\'entretien d\'assimilation';
+        var synthColor = snap._synthetic === 'deposit' ? '#06b6d4' : '#f472b6';
+        var synthDate = snap.date_statut ? U.formatDateFr(snap.date_statut) : '';
+        var synthDur = '';
+        if (j < events.length - 1) {
+          var nextEv = events[j + 1];
+          var dd = (snap.date_statut && nextEv.date_statut) ? U.daysDiff(snap.date_statut, nextEv.date_statut) : null;
+          if (dd !== null) {
+            synthDur = '<span class="ts-duration" style="color:var(--text-dim);background:rgba(148,163,184,0.1)">' + U.formatDuration(dd) + ' jusqu\'au suivant</span>';
+          }
+        }
+        timelineHtml += '<div class="timeline-step">' +
+          '<div class="timeline-dot-col">' +
+            '<div class="timeline-dot" style="background:' + synthColor + '"></div>' +
+            (j < events.length - 1 ? '<div class="timeline-line"></div>' : '') +
+          '</div>' +
+          '<div class="timeline-content">' +
+            '<div class="ts-status" style="color:' + synthColor + '">' + synthLabel + '</div>' +
+            '<div class="ts-expl">' + synthExpl + '</div>' +
+            (synthDate ? '<div class="ts-date">' + synthDate + '</div>' : '') +
+            synthDur +
+          '</div>' +
+        '</div>';
+        continue;
+      }
+
       var statutKey = (snap.statut || '').toLowerCase();
       var info = C.STATUTS[statutKey];
       var stepColor = C.STEP_COLORS[snap.etape] || '#64748b';
@@ -553,8 +618,8 @@
       var sousEtape = info ? C.formatSubStep(info.rang) : String(snap.etape);
 
       var durationHtml = '';
-      if (j < snaps.length - 1) {
-        var nextSnap = snaps[j + 1];
+      if (j < events.length - 1) {
+        var nextSnap = events[j + 1];
         if (snap.date_statut && nextSnap.date_statut) {
           var days = U.daysDiff(snap.date_statut, nextSnap.date_statut);
           var dColor = days >= 60 ? 'var(--red);background:rgba(239,68,68,0.12)' :
@@ -564,13 +629,16 @@
         }
       } else {
         if (snap.date_statut) {
-          var isTerminated = C.isFinished({ etape: snap.etape, statut: snap.statut });
+          // Étape 11 (IDD) : encore en cours, pas figé
+          var isTerminated = C.isFinished({ etape: snap.etape, statut: snap.statut }) && Number(snap.etape) !== 11;
           if (isTerminated) {
             durationHtml = '<span class="ts-duration" style="color:var(--green);background:rgba(16,185,129,0.12)">\u2705 Termin\u00e9</span>';
           } else {
             var today = new Date(); today.setHours(0, 0, 0, 0);
-            var days = U.daysDiff(snap.date_statut, today);
-            durationHtml = '<span class="ts-duration" style="color:var(--primary-light);background:rgba(59,130,246,0.12)">' + U.formatDuration(days) + ' (en cours)</span>';
+            days = U.daysDiff(snap.date_statut, today);
+            if (days !== null) {
+              durationHtml = '<span class="ts-duration" style="color:var(--primary-light);background:rgba(59,130,246,0.12)">' + U.formatDuration(days) + ' (en cours)</span>';
+            }
           }
         }
       }
@@ -580,7 +648,7 @@
       timelineHtml += '<div class="timeline-step">' +
         '<div class="timeline-dot-col">' +
           '<div class="timeline-dot" style="background:' + stepColor + '"></div>' +
-          (j < snaps.length - 1 ? '<div class="timeline-line"></div>' : '') +
+          (j < events.length - 1 ? '<div class="timeline-line"></div>' : '') +
         '</div>' +
         '<div class="timeline-content">' +
           '<div class="ts-status">' + U.escapeHtml(sousEtape) + ' \u2014 ' + U.escapeHtml(statutKey) + '</div>' +
@@ -612,7 +680,7 @@
     modal.innerHTML =
       '<div class="history-modal">' +
         '<div class="history-modal-header">' +
-          '<h3>Dossier #' + U.escapeHtml(hash) + '</h3>' +
+          '<h3>Détails du dossier</h3>' +
           '<button class="history-close" title="Fermer">\u00d7</button>' +
         '</div>' +
         '<div class="modal-history-list" style="padding:0.5rem 1rem">' +
@@ -653,8 +721,8 @@
         '<div class="hm-popover-step">' + U.escapeHtml(step) + '</div>' +
         '<div class="hm-popover-stats">' +
           '<div class="hm-popover-row"><span>Dur\u00e9e moyenne</span><strong>' + U.formatDuration(avg) + '</strong></div>' +
-          '<div class="hm-popover-row hm-popover-link" data-hash="' + U.escapeHtml(minHash) + '"><span>Plus rapide</span><strong>' + U.formatDuration(min) + ' <span class="hm-hash-link">#' + U.escapeHtml(minHash) + '</span></strong></div>' +
-          '<div class="hm-popover-row hm-popover-link" data-hash="' + U.escapeHtml(maxHash) + '"><span>Plus long</span><strong>' + U.formatDuration(max) + ' <span class="hm-hash-link">#' + U.escapeHtml(maxHash) + '</span></strong></div>' +
+          '<div class="hm-popover-row hm-popover-link" data-hash="' + U.escapeHtml(minHash) + '"><span>Plus rapide</span><strong>' + U.formatDuration(min) + '</strong></div>' +
+          '<div class="hm-popover-row hm-popover-link" data-hash="' + U.escapeHtml(maxHash) + '"><span>Plus long</span><strong>' + U.formatDuration(max) + '</strong></div>' +
           '<div class="hm-popover-row"><span>Dossiers</span><strong>' + count + '</strong></div>' +
         '</div>';
 

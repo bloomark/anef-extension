@@ -1,9 +1,6 @@
 name: Refresh Stats Data
 
 on:
-  schedule:
-    - cron: '0 7-15 * * *'  # Peak: every hour 9h-17h Paris (été UTC+2)
-    - cron: '0 5,20 * * *'  # Off-peak: 7h, 22h Paris
   workflow_dispatch:
 
 permissions:
@@ -18,7 +15,9 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    environment: github-pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
@@ -33,19 +32,27 @@ jobs:
         run: node scripts/fetch-snapshots.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
 
       - name: Inject Supabase credentials
         run: |
-          sed -i "s|__SUPABASE_URL__|${{ secrets.SUPABASE_URL }}|g" docs/shared/data.js
-          sed -i "s|__SUPABASE_ANON_KEY__|${{ secrets.SUPABASE_ANON_KEY }}|g" docs/shared/data.js
+          # Vérifier que les secrets ne sont pas vides
+          if [ -z "$SB_URL" ] || [ -z "$SB_KEY" ]; then
+            echo "::error::SUPABASE_URL or SUPABASE_ANON_KEY secret is empty or not configured"
+            exit 1
+          fi
 
-      - name: Verify no remaining tokens
-        run: |
+          sed -i "s|__SUPABASE_URL__|${SB_URL}|g" docs/shared/data.js
+          sed -i "s|__SUPABASE_ANON_KEY__|${SB_KEY}|g" docs/shared/data.js
+
           if grep -q '__SUPABASE_URL__\|__SUPABASE_ANON_KEY__' docs/shared/data.js; then
             echo "::error::Supabase tokens not replaced."
             exit 1
           fi
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
@@ -58,4 +65,5 @@ jobs:
           path: docs
 
       - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v5
